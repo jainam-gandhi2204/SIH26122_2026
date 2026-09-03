@@ -34,6 +34,17 @@ If PowerShell blocks activation, run the final command with the virtual environm
 
 The API runs at `http://127.0.0.1:8000`. Check `GET /health` or open `http://127.0.0.1:8000/docs`.
 
+## Database configuration
+
+The backend reads its PostgreSQL connection from `DATABASE_URL`. Copy
+`backend/.env.example` to `backend/.env` and set this value to the Supabase
+PostgreSQL connection string. Do not commit `.env` or expose this value to the
+frontend.
+
+With `DATABASE_URL` configured, check `GET /health/database` to verify that the
+API can connect to PostgreSQL. The existing `GET /health` endpoint remains a
+database-independent service check.
+
 ## Run the frontend
 
 In a second terminal, from the repository root:
