@@ -7,6 +7,8 @@ from app.database import DatabaseNotConfiguredError, check_database_connection, 
 from app import importer as schedule_importer
 from app import site_updates
 from app.site_updates import SiteUpdateCreate
+from app import ai_processor
+from app.ai_processor import SiteUpdateNotFoundError
 
 
 app = FastAPI(
@@ -144,4 +146,60 @@ def list_site_updates(db: Session = Depends(get_db)) -> list[dict]:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Database is unavailable",
         ) from error
+
+
+@app.post(
+    "/site-updates/{update_id}/process",
+    tags=["site-updates"],
+    status_code=status.HTTP_201_CREATED,
+)
+def process_site_update(
+    update_id: str,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Run AI processing for a stored site update and persist the result.
+
+    Re-running this endpoint replaces the previous current result (is_current
+    is set to false on the old record and a fresh row is inserted).
+    Returns the new ai_processed_updates record.
+    """
+    try:
+        return ai_processor.process_site_update(db, update_id)
+    except SiteUpdateNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(error),
+        ) from error
+    except SQLAlchemyError as error:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database is unavailable",
+        ) from error
+
+
+@app.get("/site-updates/{update_id}/process", tags=["site-updates"])
+def get_site_update_result(
+    update_id: str,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Return the current AI-processed result for a site update.
+
+    Returns 404 if the update does not exist or has not been processed yet.
+    """
+    try:
+        result = ai_processor.get_current_result(db, update_id)
+    except SQLAlchemyError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database is unavailable",
+        ) from error
+
+    if result is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No processed result found for update '{update_id}'.",
+        )
+    return result
+
 
