@@ -4,3 +4,4 @@ SQLAlchemy>=2.0,<3.0
 psycopg[binary]>=3.2,<4.0
 python-dotenv>=1.0,<2.0
 python-multipart>=0.0.9,<1.0
+google-genai>=1.0,<2.0

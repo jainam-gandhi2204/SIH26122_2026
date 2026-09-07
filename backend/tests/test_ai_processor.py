@@ -1,4 +1,4 @@
-﻿"""Unit tests for the AI processing layer.
+"""Unit tests for the AI processing layer.
 
 All tests use mocks – no database connection or API calls needed.
 """
@@ -12,7 +12,19 @@ import uuid
 from fastapi import HTTPException
 from sqlalchemy.exc import OperationalError
 
-from app.ai_provider import AIProvider, AnalysisResult, MockAIProvider, get_provider
+from app.ai_provider import (
+    AIProvider,
+    AnalysisResult,
+    GeminiAIProvider,
+    MockAIProvider,
+    _extract_json,
+    _safe_float,
+    _safe_int,
+    _safe_iso_date,
+    _safe_str,
+    _unknown_result,
+    get_provider,
+)
 from app.ai_processor import (
     SiteUpdateNotFoundError,
     _format_result,
@@ -153,6 +165,25 @@ class MockAIProviderTests(unittest.TestCase):
     def test_explicit_percent_extracted(self):
         result = self._analyse("Equipment installation is 75% complete.")
         self.assertEqual(result.progress_percent, 75.0)
+
+    def test_around_qualifier_percent_extracted(self):
+        """Regression for U002: 'around X%' must be treated as an explicitly
+        stated FACT, not an estimate to be discarded."""
+        result = self._analyse("Concreting is around 40% complete.")
+        self.assertEqual(result.progress_percent, 40.0)
+
+    def test_approximately_qualifier_percent_extracted(self):
+        """'approximately X%' must also be extracted as a FACT."""
+        result = self._analyse("Foundation work is approximately 60% done.")
+        self.assertEqual(result.progress_percent, 60.0)
+
+    def test_roughly_qualifier_percent_extracted(self):
+        result = self._analyse("Roughly 25% of the steelwork is installed.")
+        self.assertEqual(result.progress_percent, 25.0)
+
+    def test_about_qualifier_percent_extracted(self):
+        result = self._analyse("Grading is about 80% complete.")
+        self.assertEqual(result.progress_percent, 80.0)
 
     def test_completed_implies_100_percent(self):
         result = self._analyse("Site preparation completed successfully.")
@@ -410,5 +441,628 @@ class ProcessEndpointTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 503)
 
 
+# ---------------------------------------------------------------------------
+# GetProviderTests – extended to cover gemini path
+# ---------------------------------------------------------------------------
+
+class GetProviderGeminiTests(unittest.TestCase):
+    """Tests for get_provider() gemini path (mocked to avoid a real key)."""
+
+    def test_get_provider_gemini_returns_gemini_provider(self):
+        """get_provider('gemini') returns a GeminiAIProvider when key is set."""
+        with patch.dict("os.environ", {"AI_PROVIDER": "gemini", "GEMINI_API_KEY": "fake-key"}):
+            with patch("app.ai_provider.GeminiAIProvider.__init__", return_value=None):
+                provider = get_provider()
+                self.assertIsInstance(provider, GeminiAIProvider)
+
+    def test_get_provider_unknown_raises(self):
+        with patch.dict("os.environ", {"AI_PROVIDER": "chatgpt"}):
+            with self.assertRaises(ValueError) as ctx:
+                get_provider()
+            self.assertIn("chatgpt", str(ctx.exception))
+
+
+# ---------------------------------------------------------------------------
+# GeminiAIProvider – unit tests (all mock the genai client)
+# ---------------------------------------------------------------------------
+
+def _make_gemini_response(json_body: dict) -> MagicMock:
+    """Build a mock genai response whose .text is json.dumps(json_body)."""
+    resp = MagicMock()
+    resp.text = json.dumps(json_body)
+    return resp
+
+
+def _make_gemini_provider() -> GeminiAIProvider:
+    """Instantiate GeminiAIProvider with a mocked genai.Client."""
+    with patch("google.genai.Client") as MockClient:
+        provider = GeminiAIProvider.__new__(GeminiAIProvider)
+        provider._client = MockClient.return_value
+        provider._types = MagicMock()
+        provider._types.GenerateContentConfig = MagicMock()
+    return provider
+
+
+SAMPLE_TASKS_FOR_GEMINI = [
+    {
+        "id": SAMPLE_TASK_ID,
+        "source_task_id": "T101",
+        "activity": "Site Preparation",
+        "location": "Well Pad A",
+        "planned_start": "2026-09-01",
+        "planned_end": "2026-09-05",
+    }
+]
+
+
+class GeminiAIProviderTests(unittest.TestCase):
+    """Unit tests for GeminiAIProvider.analyse() with all genai calls mocked."""
+
+    def setUp(self):
+        self.provider = _make_gemini_provider()
+
+    def _call_with_response(self, json_body: dict, tasks=None) -> AnalysisResult:
+        """Call provider.analyse() with a mocked API response."""
+        self.provider._client.models.generate_content.return_value = (
+            _make_gemini_response(json_body)
+        )
+        return self.provider.analyse(
+            raw_update="Site preparation completed successfully.",
+            location="Well Pad A",
+            reported_on="2026-09-05",
+            candidate_tasks=tasks if tasks is not None else SAMPLE_TASKS_FOR_GEMINI,
+        )
+
+    # --- Happy path ---
+
+    def test_completed_status_parsed(self):
+        result = self._call_with_response({
+            "matched_source_task_id": "T101",
+            "status": "completed",
+            "progress_percent": 100,
+            "delay_days": None,
+            "delay_reason": None,
+            "actual_start_date": None,
+            "actual_end_date": None,
+            "confidence_score": 85,
+            "reasoning": "Update clearly states completion.",
+        })
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.progress_percent, 100.0)
+        self.assertEqual(result.confidence_score, 85.0)
+        self.assertEqual(result.matched_task_id, SAMPLE_TASK_ID)
+
+    def test_task_id_resolved_from_source_task_id(self):
+        result = self._call_with_response({
+            "matched_source_task_id": "T101",
+            "status": "in_progress",
+            "progress_percent": 60,
+            "delay_days": None,
+            "delay_reason": None,
+            "actual_start_date": None,
+            "actual_end_date": None,
+            "confidence_score": 70,
+            "reasoning": "Task matched by location and activity.",
+        })
+        self.assertEqual(result.matched_task_id, SAMPLE_TASK_ID)
+
+    def test_unknown_source_task_id_gives_none_match(self):
+        result = self._call_with_response({
+            "matched_source_task_id": "T999",  # not in task list
+            "status": "in_progress",
+            "progress_percent": None,
+            "delay_days": None,
+            "delay_reason": None,
+            "actual_start_date": None,
+            "actual_end_date": None,
+            "confidence_score": 40,
+            "reasoning": "Unknown task.",
+        })
+        self.assertIsNone(result.matched_task_id)
+
+    def test_delay_fields_extracted(self):
+        result = self._call_with_response({
+            "matched_source_task_id": "T101",
+            "status": "delayed",
+            "progress_percent": None,
+            "delay_days": 3,
+            "delay_reason": "Heavy rainfall blocked access",
+            "actual_start_date": None,
+            "actual_end_date": None,
+            "confidence_score": 75,
+            "reasoning": "Delay explicitly mentioned.",
+        })
+        self.assertEqual(result.status, "delayed")
+        self.assertEqual(result.delay_days, 3)
+        self.assertEqual(result.delay_reason, "Heavy rainfall blocked access")
+
+    def test_valid_actual_dates_parsed(self):
+        result = self._call_with_response({
+            "matched_source_task_id": "T101",
+            "status": "completed",
+            "progress_percent": 100,
+            "delay_days": None,
+            "delay_reason": None,
+            "actual_start_date": "2026-09-01",
+            "actual_end_date": "2026-09-05",
+            "confidence_score": 90,
+            "reasoning": "Explicit dates stated.",
+        })
+        self.assertEqual(result.actual_start_date, "2026-09-01")
+        self.assertEqual(result.actual_end_date, "2026-09-05")
+
+    def test_model_name_is_gemini(self):
+        result = self._call_with_response({
+            "matched_source_task_id": None,
+            "status": None,
+            "progress_percent": None,
+            "delay_days": None,
+            "delay_reason": None,
+            "actual_start_date": None,
+            "actual_end_date": None,
+            "confidence_score": 20,
+            "reasoning": "Vague update.",
+        })
+        self.assertEqual(result.model_name, "gemini-3.6-flash")
+
+    def test_model_response_contains_raw_json(self):
+        result = self._call_with_response({
+            "matched_source_task_id": "T101",
+            "status": "in_progress",
+            "progress_percent": 50,
+            "delay_days": None,
+            "delay_reason": None,
+            "actual_start_date": None,
+            "actual_end_date": None,
+            "confidence_score": 65,
+            "reasoning": "In progress.",
+        })
+        self.assertIn("raw_json", result.model_response)
+        self.assertIn("reasoning", result.model_response)
+
+    # --- Validation / safety ---
+
+    def test_invalid_status_rejected(self):
+        """A status not in the DB enum is silently dropped to None."""
+        result = self._call_with_response({
+            "matched_source_task_id": None,
+            "status": "partially_done",      # not a valid DB status
+            "progress_percent": None,
+            "delay_days": None,
+            "delay_reason": None,
+            "actual_start_date": None,
+            "actual_end_date": None,
+            "confidence_score": 30,
+            "reasoning": "Unknown status from model.",
+        })
+        self.assertIsNone(result.status)
+
+    def test_out_of_range_progress_rejected(self):
+        """progress_percent > 100 is silently dropped to None."""
+        result = self._call_with_response({
+            "matched_source_task_id": None,
+            "status": None,
+            "progress_percent": 150,    # invalid
+            "delay_days": None,
+            "delay_reason": None,
+            "actual_start_date": None,
+            "actual_end_date": None,
+            "confidence_score": 50,
+            "reasoning": "Test.",
+        })
+        self.assertIsNone(result.progress_percent)
+
+    def test_negative_delay_days_rejected(self):
+        """Negative delay_days is silently dropped to None."""
+        result = self._call_with_response({
+            "matched_source_task_id": None,
+            "status": "delayed",
+            "progress_percent": None,
+            "delay_days": -5,           # invalid
+            "delay_reason": None,
+            "actual_start_date": None,
+            "actual_end_date": None,
+            "confidence_score": 50,
+            "reasoning": "Test.",
+        })
+        self.assertIsNone(result.delay_days)
+
+    def test_malformed_date_rejected(self):
+        """Dates not in YYYY-MM-DD format are dropped to None."""
+        result = self._call_with_response({
+            "matched_source_task_id": None,
+            "status": "completed",
+            "progress_percent": 100,
+            "delay_days": None,
+            "delay_reason": None,
+            "actual_start_date": "05-Sep-2026",    # wrong format
+            "actual_end_date": "2026/09/05",        # wrong format
+            "confidence_score": 80,
+            "reasoning": "Test.",
+        })
+        self.assertIsNone(result.actual_start_date)
+        self.assertIsNone(result.actual_end_date)
+
+    def test_confidence_clamped_to_100(self):
+        """Confidence scores above 100 are clamped to 100."""
+        result = self._call_with_response({
+            "matched_source_task_id": None,
+            "status": None,
+            "progress_percent": None,
+            "delay_days": None,
+            "delay_reason": None,
+            "actual_start_date": None,
+            "actual_end_date": None,
+            "confidence_score": 999,    # out of range
+            "reasoning": "Test.",
+        })
+        self.assertEqual(result.confidence_score, 100.0)
+
+    def test_no_tasks_matched_task_id_is_none(self):
+        result = self._call_with_response({
+            "matched_source_task_id": "T101",
+            "status": "in_progress",
+            "progress_percent": None,
+            "delay_days": None,
+            "delay_reason": None,
+            "actual_start_date": None,
+            "actual_end_date": None,
+            "confidence_score": 50,
+            "reasoning": "Test.",
+        }, tasks=[])  # no tasks provided → map is empty → matched_task_id is None
+        self.assertIsNone(result.matched_task_id)
+
+    # --- U002-style regression: approximation-qualified percentages (FACT) ---
+
+    def test_progress_with_around_qualifier_extracted(self):
+        """Regression for U002: 'concreting is around 40% complete' must yield
+        progress_percent=40.0.  The word 'around' is an approximation qualifier,
+        not an invented estimate — the reporter explicitly stated the figure."""
+        result = self._call_with_response({
+            "matched_source_task_id": "T101",
+            "status": "in_progress",
+            "progress_percent": 40,       # model should now extract this
+            "delay_days": None,
+            "delay_reason": None,
+            "actual_start_date": None,
+            "actual_end_date": None,
+            "confidence_score": 75,
+            "reasoning": "Update states 'around 40% complete'.",
+        })
+        self.assertEqual(result.progress_percent, 40.0)
+        self.assertEqual(result.status, "in_progress")
+
+    def test_progress_with_approximately_qualifier_extracted(self):
+        """'approximately 60% done' should yield progress_percent=60.0."""
+        result = self._call_with_response({
+            "matched_source_task_id": "T101",
+            "status": "in_progress",
+            "progress_percent": 60,
+            "delay_days": None,
+            "delay_reason": None,
+            "actual_start_date": None,
+            "actual_end_date": None,
+            "confidence_score": 72,
+            "reasoning": "Update states 'approximately 60% done'.",
+        })
+        self.assertEqual(result.progress_percent, 60.0)
+
+    def test_progress_null_when_no_percentage_stated(self):
+        """When no percentage figure is mentioned, progress_percent must stay null.
+        Ensures the hallucination guard is preserved."""
+        result = self._call_with_response({
+            "matched_source_task_id": "T101",
+            "status": "in_progress",
+            "progress_percent": None,     # no percentage in text
+            "delay_days": None,
+            "delay_reason": None,
+            "actual_start_date": None,
+            "actual_end_date": None,
+            "confidence_score": 55,
+            "reasoning": "Work is ongoing; no percentage stated.",
+        })
+        self.assertIsNone(result.progress_percent)
+
+    # --- Error / fallback handling ---
+
+    def test_api_exception_returns_unknown_result(self):
+        """Any API exception returns a zero-confidence all-None result."""
+        from google.genai.errors import APIError
+        self.provider._client.models.generate_content.side_effect = Exception("Network timeout")
+        result = self.provider.analyse(
+            raw_update="Test update.",
+            location="Zone A",
+            reported_on="2026-09-05",
+            candidate_tasks=[],
+        )
+        self.assertIsNone(result.status)
+        self.assertIsNone(result.matched_task_id)
+        self.assertEqual(result.confidence_score, 0.0)
+        self.assertIn("error", result.model_response)
+
+    def test_invalid_json_response_returns_unknown_result(self):
+        """A non-JSON response string triggers the fallback."""
+        resp = MagicMock()
+        resp.text = "Sorry, I cannot process this request."
+        self.provider._client.models.generate_content.return_value = resp
+        result = self.provider.analyse(
+            raw_update="Test update.",
+            location="Zone A",
+            reported_on="2026-09-05",
+            candidate_tasks=[],
+        )
+        self.assertEqual(result.confidence_score, 0.0)
+        self.assertIsNone(result.status)
+
+    def test_missing_key_raises_value_error(self):
+        """GeminiAIProvider.__init__ raises ValueError with no API key."""
+        with patch.dict("os.environ", {}, clear=True):
+            # Patch google.genai.Client to avoid actually hitting network
+            with patch("google.genai.Client"):
+                with self.assertRaises(ValueError) as ctx:
+                    GeminiAIProvider(api_key=None)
+                self.assertIn("GEMINI_API_KEY", str(ctx.exception))
+
+
+# ---------------------------------------------------------------------------
+# _extract_json unit tests  (covers the exact U002 failure scenario)
+# ---------------------------------------------------------------------------
+
+class ExtractJsonTests(unittest.TestCase):
+    """Unit tests for the _extract_json helper.
+
+    This function is the fix for the reported 'Unterminated string starting
+    at line 5 column 3' error: previously json.loads was called directly on
+    the raw model text without any pre-processing.
+    """
+
+    # --- Happy path: plain JSON (MIME type honoured by model) ---
+
+    def test_plain_json_parsed(self):
+        result = _extract_json('{"status": "completed", "progress_percent": 100}')
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["progress_percent"], 100)
+
+    def test_plain_json_with_leading_trailing_whitespace(self):
+        result = _extract_json('  \n{"status": "in_progress"}\n  ')
+        self.assertEqual(result["status"], "in_progress")
+
+    def test_plain_json_all_null_fields(self):
+        payload = json.dumps({
+            "matched_source_task_id": None,
+            "status": None,
+            "progress_percent": None,
+            "delay_days": None,
+            "delay_reason": None,
+            "actual_start_date": None,
+            "actual_end_date": None,
+            "confidence_score": 25,
+            "reasoning": "Vague update.",
+        })
+        result = _extract_json(payload)
+        self.assertIsNone(result["status"])
+        self.assertEqual(result["confidence_score"], 25)
+
+    # --- Fenced JSON (model ignores response_mime_type) ---
+
+    def test_fenced_json_with_language_tag(self):
+        text = '```json\n{"status": "delayed", "delay_days": 3}\n```'
+        result = _extract_json(text)
+        self.assertEqual(result["status"], "delayed")
+        self.assertEqual(result["delay_days"], 3)
+
+    def test_fenced_json_without_language_tag(self):
+        text = '```\n{"status": "completed"}\n```'
+        result = _extract_json(text)
+        self.assertEqual(result["status"], "completed")
+
+    def test_fenced_json_with_surrounding_prose(self):
+        text = (
+            "Here is the analysis:\n"
+            "```json\n"
+            '{"status": "in_progress", "confidence_score": 70}\n'
+            "```\n"
+            "Let me know if you need more detail."
+        )
+        result = _extract_json(text)
+        self.assertEqual(result["status"], "in_progress")
+
+    def test_fenced_json_uppercase_JSON_tag(self):
+        text = '```JSON\n{"status": "blocked"}\n```'
+        result = _extract_json(text)
+        self.assertEqual(result["status"], "blocked")
+
+    # --- Brace-extraction fallback (prose wrapping the JSON) ---
+
+    def test_json_embedded_in_prose_extracted_by_braces(self):
+        text = 'The answer is: {"status": "not_started", "confidence_score": 30} — end.'
+        result = _extract_json(text)
+        self.assertEqual(result["status"], "not_started")
+
+    # --- Error cases ---
+
+    def test_empty_string_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            _extract_json("")
+
+    def test_whitespace_only_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            _extract_json("   \n  ")
+
+    def test_plain_prose_with_no_json_raises_value_error(self):
+        """Reproduces the exact class of failure: model returned non-JSON prose."""
+        with self.assertRaises((ValueError, json.JSONDecodeError)):
+            _extract_json("I cannot process this request.")
+
+    def test_truncated_json_raises_parse_error(self):
+        """Reproduces the EXACT U002 failure: 'Unterminated string starting at
+        line 5 column 3' — caused by max_output_tokens truncating mid-string.
+
+        When the JSON is truncated before the closing brace, _extract_json raises
+        ValueError (no JSON object found) or JSONDecodeError depending on whether
+        a closing brace is accidentally present. Both mean 'could not parse', and
+        the caller (analyse()) handles both by returning a zero-confidence result.
+        """
+        truncated = '{"status": "in_progress", "reasoning": "Work is ongoing at the site and crews are'
+        with self.assertRaises((ValueError, json.JSONDecodeError)):
+            _extract_json(truncated)
+
+    def test_fenced_truncated_json_raises_json_decode_error(self):
+        """Fenced response that was also truncated mid-string."""
+        truncated_fenced = '```json\n{"status": "delayed", "reasoning": "Equipment broke'
+        with self.assertRaises((ValueError, json.JSONDecodeError)):
+            _extract_json(truncated_fenced)
+
+
+# ---------------------------------------------------------------------------
+# GeminiAIProviderTests – parse robustness (end-to-end via analyse())
+# ---------------------------------------------------------------------------
+
+class GeminiParseRobustnessTests(unittest.TestCase):
+    """End-to-end tests for the new parsing paths in GeminiAIProvider.analyse().
+
+    All calls go through the real analyse() code but with the genai client mocked.
+    """
+
+    def setUp(self):
+        self.provider = _make_gemini_provider()
+
+    def _set_response_text(self, text: str) -> None:
+        resp = MagicMock()
+        resp.text = text
+        self.provider._client.models.generate_content.return_value = resp
+
+    def test_fenced_json_response_is_parsed_correctly(self):
+        """Model wraps its output in ```json fences — must still be handled."""
+        self._set_response_text(
+            '```json\n'
+            '{"matched_source_task_id": "T101", "status": "completed", '
+            '"progress_percent": 100, "delay_days": null, "delay_reason": null, '
+            '"actual_start_date": null, "actual_end_date": null, '
+            '"confidence_score": 85, "reasoning": "Clearly done."}\n'
+            '```'
+        )
+        result = self.provider.analyse(
+            raw_update="Site preparation completed.",
+            location="Well Pad A",
+            reported_on="2026-09-07",
+            candidate_tasks=SAMPLE_TASKS_FOR_GEMINI,
+        )
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.progress_percent, 100.0)
+        self.assertEqual(result.matched_task_id, SAMPLE_TASK_ID)
+        self.assertGreater(result.confidence_score, 0)
+
+    def test_fenced_json_no_language_tag_parsed(self):
+        """Model uses ``` without json tag — must still be handled."""
+        self._set_response_text(
+            '```\n{"status": "in_progress", "confidence_score": 60, '
+            '"matched_source_task_id": null, "progress_percent": null, '
+            '"delay_days": null, "delay_reason": null, '
+            '"actual_start_date": null, "actual_end_date": null, '
+            '"reasoning": "Ongoing."}\n```'
+        )
+        result = self.provider.analyse(
+            raw_update="Work is ongoing.",
+            location="Well Pad A",
+            reported_on="2026-09-07",
+            candidate_tasks=[],
+        )
+        self.assertEqual(result.status, "in_progress")
+        self.assertEqual(result.confidence_score, 60.0)
+
+    def test_truncated_json_returns_unknown_result(self):
+        """The exact U002 failure: truncated JSON → parse error → zero-confidence fallback,
+        NOT a crash. Previously this would raise and surface as a 500 error."""
+        truncated = (
+            '{"status": "in_progress", "matched_source_task_id": "T101", '
+            '"reasoning": "Work is ongoing at the site and crews are'
+            # truncated here — no closing quote, brace, etc.
+        )
+        self._set_response_text(truncated)
+        result = self.provider.analyse(
+            raw_update="Work ongoing.",
+            location="Well Pad A",
+            reported_on="2026-09-07",
+            candidate_tasks=SAMPLE_TASKS_FOR_GEMINI,
+        )
+        # Must not crash; must return a safe fallback
+        self.assertEqual(result.confidence_score, 0.0)
+        self.assertIsNone(result.status)
+        self.assertIsNone(result.matched_task_id)
+        self.assertIn("error", result.model_response)
+
+    def test_empty_response_returns_unknown_result(self):
+        """Empty response text → ValueError in _extract_json → fallback."""
+        self._set_response_text("")
+        result = self.provider.analyse(
+            raw_update="Site update.", location="X", reported_on="2026-09-07",
+            candidate_tasks=[],
+        )
+        self.assertEqual(result.confidence_score, 0.0)
+        self.assertIn("error", result.model_response)
+
+    def test_api_error_returns_unknown_result(self):
+        """Network error during API call → fallback (unchanged from before)."""
+        self.provider._client.models.generate_content.side_effect = Exception("Timeout")
+        result = self.provider.analyse(
+            raw_update="Update.", location="X", reported_on="2026-09-07",
+            candidate_tasks=[],
+        )
+        self.assertEqual(result.confidence_score, 0.0)
+        self.assertIn("error", result.model_response)
+
+
+# ---------------------------------------------------------------------------
+# Safe parsing helper tests
+# ---------------------------------------------------------------------------
+
+class SafeParsingHelperTests(unittest.TestCase):
+    """Unit tests for the parsing utility functions."""
+
+    def test_safe_str_strips_whitespace(self):
+        self.assertEqual(_safe_str("  hello  "), "hello")
+
+    def test_safe_str_none_input(self):
+        self.assertIsNone(_safe_str(None))
+
+    def test_safe_str_null_string(self):
+        self.assertIsNone(_safe_str("null"))
+
+    def test_safe_str_empty_string(self):
+        self.assertIsNone(_safe_str(""))
+
+    def test_safe_float_valid(self):
+        self.assertEqual(_safe_float("75.5"), 75.5)
+
+    def test_safe_float_invalid(self):
+        self.assertIsNone(_safe_float("not-a-number"))
+
+    def test_safe_float_none(self):
+        self.assertIsNone(_safe_float(None))
+
+    def test_safe_int_valid(self):
+        self.assertEqual(_safe_int("3"), 3)
+
+    def test_safe_int_invalid(self):
+        self.assertIsNone(_safe_int("three"))
+
+    def test_safe_int_none(self):
+        self.assertIsNone(_safe_int(None))
+
+    def test_safe_iso_date_valid(self):
+        self.assertEqual(_safe_iso_date("2026-09-05"), "2026-09-05")
+
+    def test_safe_iso_date_wrong_format(self):
+        self.assertIsNone(_safe_iso_date("05-Sep-2026"))
+
+    def test_safe_iso_date_none(self):
+        self.assertIsNone(_safe_iso_date(None))
+
+    def test_safe_iso_date_slash_format(self):
+        self.assertIsNone(_safe_iso_date("2026/09/05"))
+
+
 if __name__ == "__main__":
     unittest.main()
+

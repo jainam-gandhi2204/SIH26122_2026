@@ -33,7 +33,7 @@ _FETCH_SITE_UPDATE = text(
     """
     SELECT id, source_update_id, reported_on, location, raw_update, ingested_at, source_reference
     FROM site_updates
-    WHERE id = :update_id
+    WHERE source_update_id = :update_id
     """
 )
 
@@ -206,6 +206,7 @@ def process_site_update(
     update_row = db.execute(_FETCH_SITE_UPDATE, {"update_id": update_id}).fetchone()
     if update_row is None:
         raise SiteUpdateNotFoundError(f"Site update '{update_id}' not found")
+    update_id = str(update_row.id)
 
     # 2. Candidate tasks at the same location
     task_rows = db.execute(
