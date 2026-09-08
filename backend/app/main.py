@@ -11,6 +11,7 @@ from app import ai_processor
 from app.ai_processor import SiteUpdateNotFoundError
 from app import spreadsheet_ingestor
 from app import schedule_linker
+from app import review_queue
 
 
 app = FastAPI(
@@ -368,3 +369,32 @@ def get_task_impact(
             detail=f"Task '{task_id}' not found.",
         )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Planner Review Queue
+# ---------------------------------------------------------------------------
+
+@app.get("/review/queue", tags=["review"])
+@app.get("/planner/review-queue", tags=["review"])
+def get_planner_review_queue(
+    threshold: float = 70.0,
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    """Retrieve site updates requiring planner review.
+
+    Includes all AI-processed updates where:
+    - matched_task_id is null (no schedule task could be linked), or
+    - confidence_score is below the threshold (default: 70.0).
+
+    Returns raw update text, extracted activity/progress/status, confidence,
+    review reason, and a suggested match (if available) for planner inspection.
+    Does NOT automatically attach or mutate uncertain matches.
+    """
+    try:
+        return review_queue.get_review_queue(db, threshold=threshold)
+    except SQLAlchemyError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database is unavailable",
+        ) from error
