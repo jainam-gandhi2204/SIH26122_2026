@@ -1,0 +1,8 @@
+Task ID,Activity,Location,Planned Start,Planned End,Dependency
+T101,Site Preparation,Well Pad A,01-Sep-2026,05-Sep-2026,-
+T102,Foundation Construction,Well Pad A,06-Sep-2026,15-Sep-2026,T101
+T103,Equipment Installation,Well Pad A,16-Sep-2026,20-Sep-2026,T102
+T104,Testing and Commissioning,Well Pad A,21-Sep-2026,25-Sep-2026,T103
+T105,Pipeline Connection,Well Pad A,18-Sep-2026,24-Sep-2026,T102
+T106,Pressure Testing,Well Pad A,25-Sep-2026,27-Sep-2026,T105
+T107,Final Inspection,Well Pad A,28-Sep-2026,29-Sep-2026,"T104,T106"

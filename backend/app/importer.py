@@ -1,4 +1,4 @@
-﻿"""CSV schedule importer: parsing, validation, and database insertion.
+"""CSV schedule importer: parsing, validation, and database insertion.
 
 Kept separate from main.py so the logic can be unit-tested without FastAPI.
 """
@@ -37,7 +37,7 @@ class ParsedRow:
     location: str
     planned_start: datetime.date
     planned_end: datetime.date
-    dependency: str  # raw string from CSV; "-" means none
+    dependencies: list[str]  # list of upstream source_task_ids; empty means none
 
 
 @dataclass
@@ -73,8 +73,12 @@ def _parse_date(raw: str, field_name: str, row_number: int, task_id: str) -> dat
 
 
 def _strip_row(row: dict[str, Any]) -> dict[str, str]:
-    """Strip whitespace from all keys and values in a CSV row dict."""
-    return {k.strip(): (v.strip() if v else "") for k, v in row.items()}
+    """Strip whitespace from all keys and values in a CSV row dict.
+
+    csv.DictReader uses None as the key for any overflow values when a row
+    has more columns than the header.  We skip those safely here.
+    """
+    return {k.strip(): (v.strip() if v else "") for k, v in row.items() if k is not None}
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +153,12 @@ def parse_and_validate(content: bytes, filename: str) -> tuple[list[ParsedRow], 
             ))
             continue
 
-        dependency = row.get("Dependency", "").strip() or NO_DEPENDENCY
+        # Parse dependency field: split on comma, strip, drop "-" and blanks
+        raw_dep = row.get("Dependency", "").strip()
+        if not raw_dep or raw_dep == NO_DEPENDENCY:
+            dep_list: list[str] = []
+        else:
+            dep_list = [d.strip() for d in raw_dep.split(",") if d.strip() and d.strip() != NO_DEPENDENCY]
 
         rows.append(ParsedRow(
             source_task_id=task_id,
@@ -157,18 +166,18 @@ def parse_and_validate(content: bytes, filename: str) -> tuple[list[ParsedRow], 
             location=location,
             planned_start=start,
             planned_end=end,
-            dependency=dependency,
+            dependencies=dep_list,
         ))
 
     # --- dependency reference check (only against tasks that passed row validation) ---
     valid_ids = {r.source_task_id for r in rows}
     for row_index, parsed in enumerate(rows, start=1):
-        dep = parsed.dependency
-        if dep != NO_DEPENDENCY and dep not in valid_ids:
-            errors.append(ValidationError(
-                row_index, parsed.source_task_id,
-                f"Dependency '{dep}' does not reference a known Task ID in this CSV"
-            ))
+        for dep in parsed.dependencies:
+            if dep not in valid_ids:
+                errors.append(ValidationError(
+                    row_index, parsed.source_task_id,
+                    f"Dependency '{dep}' does not reference a known Task ID in this CSV"
+                ))
 
     # Remove any rows whose task_id has a dependency error so we never insert partial data
     if errors:
@@ -183,14 +192,34 @@ def import_to_db(
     rows: list[ParsedRow],
     filename: str,
 ) -> ImportResult:
-    """Insert schedule_imports + schedule_tasks + task_dependencies.
+    """Insert or update schedule_imports + schedule_tasks + task_dependencies.
+
+    Idempotency strategy
+    --------------------
+    1. A new schedule_imports record is inserted to preserve the audit trail
+       of each import attempt.
+    2. For each incoming row:
+       - If a task with that source_task_id already exists in schedule_tasks,
+         it is UPDATED in place. Its existing primary key (UUID) is preserved,
+         ensuring that foreign-key relationships (such as
+         ai_processed_updates.matched_task_id) remain intact.
+       - If it does not exist, a new schedule_tasks row is INSERTED with a
+         fresh UUID.
+       - If duplicate rows exist for the same source_task_id (e.g. from prior
+         buggy imports), the canonical task (prioritizing tasks already
+         referenced by ai_processed_updates) is preserved and redundant
+         duplicates are removed.
+    3. Existing task_dependencies for the imported tasks are refreshed so
+       that re-importing the same CSV does not duplicate dependency edges,
+       while fully supporting single and multiple dependencies (e.g. T107 ->
+       T104 and T106).
 
     Raises SQLAlchemyError on any database failure (caller handles rollback
     because the session is managed by FastAPI's get_db() generator).
     """
     import_id = str(uuid.uuid4())
 
-    # 1. Insert the schedule_imports parent record
+    # 1. Insert the schedule_imports parent record (audit trail)
     db.execute(
         text(
             """
@@ -201,50 +230,137 @@ def import_to_db(
         {"id": import_id, "filename": filename, "row_count": len(rows)},
     )
 
-    # 2. Insert schedule_tasks; collect source_task_id -> db UUID mapping
-    task_id_map: dict[str, str] = {}  # source_task_id -> DB UUID
-    for row in rows:
-        task_uuid = str(uuid.uuid4())
-        task_id_map[row.source_task_id] = task_uuid
-        db.execute(
-            text(
-                """
-                INSERT INTO schedule_tasks
-                    (id, schedule_import_id, source_task_id, activity,
-                     location, planned_start, planned_end)
-                VALUES
-                    (:id, :import_id, :source_task_id, :activity,
-                     :location, :planned_start, :planned_end)
-                """
-            ),
-            {
-                "id": task_uuid,
-                "import_id": import_id,
-                "source_task_id": row.source_task_id,
-                "activity": row.activity,
-                "location": row.location,
-                "planned_start": row.planned_start,
-                "planned_end": row.planned_end,
-            },
+    if not rows:
+        db.commit()
+        return ImportResult(
+            import_id=import_id,
+            filename=filename,
+            tasks_imported=0,
+            dependencies_imported=0,
         )
 
-    # 3. Insert task_dependencies
-    deps_inserted = 0
+    # 2. Look up existing schedule_tasks by source_task_id to preserve UUIDs
+    source_ids = [r.source_task_id for r in rows]
+    placeholders = ", ".join(f":sid_{i}" for i in range(len(source_ids)))
+    params = {f"sid_{i}": sid for i, sid in enumerate(source_ids)}
+
+    existing_rows = db.execute(
+        text(
+            f"""
+            SELECT st.id, st.source_task_id, count(ap.id) AS ai_count
+            FROM schedule_tasks st
+            LEFT JOIN ai_processed_updates ap ON ap.matched_task_id = st.id
+            WHERE st.source_task_id IN ({placeholders})
+            GROUP BY st.id, st.source_task_id, st.created_at
+            ORDER BY count(ap.id) DESC, st.created_at ASC
+            """
+        ),
+        params,
+    ).fetchall()
+
+    existing_map: dict[str, str] = {}
+    duplicate_ids_to_clean: list[str] = []
+
+    for r in existing_rows:
+        sid = r.source_task_id
+        tid = str(r.id)
+        if sid not in existing_map:
+            existing_map[sid] = tid
+        else:
+            duplicate_ids_to_clean.append(tid)
+
+    # Clean up redundant duplicate rows if any existed from prior imports
+    if duplicate_ids_to_clean:
+        dup_placeholders = ", ".join(f":dup_{i}" for i in range(len(duplicate_ids_to_clean)))
+        dup_params = {f"dup_{i}": did for i, did in enumerate(duplicate_ids_to_clean)}
+        db.execute(
+            text(f"DELETE FROM schedule_tasks WHERE id IN ({dup_placeholders})"),
+            dup_params,
+        )
+
+    # 3. Upsert schedule_tasks (UPDATE existing to preserve UUID, INSERT new)
+    task_id_map: dict[str, str] = {}  # source_task_id -> DB UUID
     for row in rows:
-        if row.dependency != NO_DEPENDENCY and row.dependency in task_id_map:
+        if row.source_task_id in existing_map:
+            task_uuid = existing_map[row.source_task_id]
+            task_id_map[row.source_task_id] = task_uuid
             db.execute(
                 text(
                     """
-                    INSERT INTO task_dependencies (task_id, depends_on_task_id)
-                    VALUES (:task_id, :depends_on_task_id)
+                    UPDATE schedule_tasks
+                    SET schedule_import_id = :import_id,
+                        activity = :activity,
+                        location = :location,
+                        planned_start = :planned_start,
+                        planned_end = :planned_end,
+                        updated_at = now()
+                    WHERE id = :id
                     """
                 ),
                 {
-                    "task_id": task_id_map[row.source_task_id],
-                    "depends_on_task_id": task_id_map[row.dependency],
+                    "id": task_uuid,
+                    "import_id": import_id,
+                    "activity": row.activity,
+                    "location": row.location,
+                    "planned_start": row.planned_start,
+                    "planned_end": row.planned_end,
                 },
             )
-            deps_inserted += 1
+        else:
+            task_uuid = str(uuid.uuid4())
+            task_id_map[row.source_task_id] = task_uuid
+            db.execute(
+                text(
+                    """
+                    INSERT INTO schedule_tasks
+                        (id, schedule_import_id, source_task_id, activity,
+                         location, planned_start, planned_end)
+                    VALUES
+                        (:id, :import_id, :source_task_id, :activity,
+                         :location, :planned_start, :planned_end)
+                    """
+                ),
+                {
+                    "id": task_uuid,
+                    "import_id": import_id,
+                    "source_task_id": row.source_task_id,
+                    "activity": row.activity,
+                    "location": row.location,
+                    "planned_start": row.planned_start,
+                    "planned_end": row.planned_end,
+                },
+            )
+
+    # 4. Refresh task_dependencies for the imported tasks without duplication
+    task_uuids = list(task_id_map.values())
+    if task_uuids:
+        tid_placeholders = ", ".join(f":tid_{i}" for i in range(len(task_uuids)))
+        tid_params = {f"tid_{i}": tid for i, tid in enumerate(task_uuids)}
+        db.execute(
+            text(f"DELETE FROM task_dependencies WHERE task_id IN ({tid_placeholders})"),
+            tid_params,
+        )
+
+    deps_inserted = 0
+    for row in rows:
+        downstream_uuid = task_id_map[row.source_task_id]
+        for dep_source_id in row.dependencies:
+            if dep_source_id in task_id_map:
+                upstream_uuid = task_id_map[dep_source_id]
+                db.execute(
+                    text(
+                        """
+                        INSERT INTO task_dependencies (task_id, depends_on_task_id)
+                        VALUES (:task_id, :depends_on_task_id)
+                        ON CONFLICT (task_id, depends_on_task_id) DO NOTHING
+                        """
+                    ),
+                    {
+                        "task_id": downstream_uuid,
+                        "depends_on_task_id": upstream_uuid,
+                    },
+                )
+                deps_inserted += 1
 
     db.commit()
 
