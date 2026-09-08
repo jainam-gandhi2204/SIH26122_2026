@@ -78,7 +78,11 @@ def _make_task_row(
     return row
 
 
-def _make_result_row(result_id: str = SAMPLE_RESULT_ID):
+def _make_result_row(
+    result_id: str = SAMPLE_RESULT_ID,
+    actual_start_date: str | None = None,
+    actual_end_date: str | None = None,
+):
     row = MagicMock()
     row.id = uuid.UUID(result_id)
     row.site_update_id = uuid.UUID(SAMPLE_UPDATE_ID)
@@ -87,8 +91,8 @@ def _make_result_row(result_id: str = SAMPLE_RESULT_ID):
     row.status = "completed"
     row.delay_days = None
     row.delay_reason = None
-    row.actual_start_date = None
-    row.actual_end_date = None
+    row.actual_start_date = actual_start_date
+    row.actual_end_date = actual_end_date
     row.confidence_score = 40.0
     row.model_name = "mock-keyword-v1"
     row.model_response = json.dumps({"note": "test"})
@@ -235,11 +239,98 @@ class MockAIProviderTests(unittest.TestCase):
         self.assertIsNotNone(result.delay_reason)
         self.assertIn("delay", result.delay_reason.lower())
 
-    def test_actual_dates_always_unknown(self):
-        result = self._analyse("Completed on 01-Sep-2026.")
-        # Mock provider never extracts actual dates (too complex / risky)
+    def test_actual_dates_unknown_when_not_stated(self):
+        """When no dates are mentioned, actual dates remain None (UNKNOWN)."""
+        result = self._analyse("Site preparation completed successfully.")
         self.assertIsNone(result.actual_start_date)
         self.assertIsNone(result.actual_end_date)
+
+    def test_actual_start_date_extracted_iso(self):
+        """Explicit 'started on YYYY-MM-DD' is extracted as actual_start_date."""
+        result = self._analyse("Excavation started on 2026-09-01 and is ongoing.")
+        self.assertEqual(result.actual_start_date, "2026-09-01")
+        self.assertIsNone(result.actual_end_date)
+
+    def test_actual_start_date_extracted_dd_mon_yyyy(self):
+        """Explicit 'started on DD-Mon-YYYY' is converted to ISO YYYY-MM-DD."""
+        result = self._analyse("Work started on 02-Sep-2026.")
+        self.assertEqual(result.actual_start_date, "2026-09-02")
+        self.assertIsNone(result.actual_end_date)
+
+    def test_actual_end_date_extracted_iso(self):
+        """Explicit 'completed on YYYY-MM-DD' is extracted as actual_end_date."""
+        result = self._analyse("Site preparation completed on 2026-09-05.")
+        self.assertIsNone(result.actual_start_date)
+        self.assertEqual(result.actual_end_date, "2026-09-05")
+
+    def test_actual_end_date_extracted_dd_mon_yyyy(self):
+        """Explicit 'completed on DD-Mon-YYYY' is converted to ISO YYYY-MM-DD."""
+        result = self._analyse("Completed on 01-Sep-2026.")
+        self.assertIsNone(result.actual_start_date)
+        self.assertEqual(result.actual_end_date, "2026-09-01")
+
+    def test_both_actual_dates_extracted(self):
+        """Both start and end dates extracted when both are explicitly stated."""
+        result = self._analyse(
+            "Site preparation started on 2026-09-01 and completed on 2026-09-05."
+        )
+        self.assertEqual(result.actual_start_date, "2026-09-01")
+        self.assertEqual(result.actual_end_date, "2026-09-05")
+
+    def test_actual_start_alternative_phrasings(self):
+        """Test commenced, began, start date, and actual start phrasings."""
+        r1 = self._analyse("Piling commenced on 03-Sep-2026.")
+        self.assertEqual(r1.actual_start_date, "2026-09-03")
+
+        r2 = self._analyse("Foundation work began on 2026-09-04.")
+        self.assertEqual(r2.actual_start_date, "2026-09-04")
+
+        r3 = self._analyse("Start date: 2026-09-01. Work is progressing.")
+        self.assertEqual(r3.actual_start_date, "2026-09-01")
+
+        r4 = self._analyse("Actual start: 2026-09-02.")
+        self.assertEqual(r4.actual_start_date, "2026-09-02")
+
+    def test_actual_end_alternative_phrasings(self):
+        """Test finished, ended, completion date, and actual end phrasings."""
+        r1 = self._analyse("Grading finished on 05-Sep-2026.")
+        self.assertEqual(r1.actual_end_date, "2026-09-05")
+
+        r2 = self._analyse("Activity ended on 2026-09-06.")
+        self.assertEqual(r2.actual_end_date, "2026-09-06")
+
+        r3 = self._analyse("Completion date: 2026-09-07.")
+        self.assertEqual(r3.actual_end_date, "2026-09-07")
+
+        r4 = self._analyse("Actual end: 2026-09-08.")
+        self.assertEqual(r4.actual_end_date, "2026-09-08")
+
+    def test_planned_dates_not_extracted_as_actual(self):
+        """Planned dates should not be confused with actual start dates."""
+        result = self._analyse(
+            "Planned start date: 2026-09-01. Actual start date: 2026-09-03."
+        )
+        self.assertEqual(result.actual_start_date, "2026-09-03")
+
+    def test_progress_percent_does_not_trigger_end_date(self):
+        """Statements like '40% complete' must NOT set actual_end_date."""
+        result = self._analyse(
+            "Concreting is around 40% complete. Delayed by 2 days due to rain."
+        )
+        self.assertIsNone(result.actual_start_date)
+        self.assertIsNone(result.actual_end_date)
+        self.assertEqual(result.progress_percent, 40.0)
+
+    def test_relative_date_words_remain_unknown(self):
+        """Relative terms like 'today' or 'yesterday' never invent dates."""
+        result = self._analyse("Work started today and finished yesterday.")
+        self.assertIsNone(result.actual_start_date)
+        self.assertIsNone(result.actual_end_date)
+
+    def test_invalid_calendar_date_returns_none(self):
+        """Impossible calendar dates (e.g. Feb 31) are rejected as None."""
+        result = self._analyse("Work started on 2026-02-31.")
+        self.assertIsNone(result.actual_start_date)
 
     def test_model_name_is_correct(self):
         result = self._analyse("Test.")
@@ -287,7 +378,14 @@ class GetProviderTests(unittest.TestCase):
 
 class ProcessSiteUpdateTests(unittest.TestCase):
 
-    def _make_stub_provider(self, task_id=SAMPLE_TASK_ID, status="completed", progress=100.0):
+    def _make_stub_provider(
+        self,
+        task_id=SAMPLE_TASK_ID,
+        status="completed",
+        progress=100.0,
+        actual_start_date=None,
+        actual_end_date=None,
+    ):
         provider = MagicMock(spec=AIProvider)
         provider.analyse.return_value = AnalysisResult(
             matched_task_id=task_id,
@@ -295,8 +393,8 @@ class ProcessSiteUpdateTests(unittest.TestCase):
             status=status,
             delay_days=None,
             delay_reason=None,
-            actual_start_date=None,
-            actual_end_date=None,
+            actual_start_date=actual_start_date,
+            actual_end_date=actual_end_date,
             confidence_score=40.0,
             model_name="mock-keyword-v1",
             model_response={"note": "stub"},
@@ -317,6 +415,33 @@ class ProcessSiteUpdateTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertTrue(result["is_current"])
         mock_db.commit.assert_called_once()
+
+    def test_process_persists_actual_dates_to_database(self):
+        update_row = _make_update_row(
+            raw_update="Site preparation started on 2026-09-01 and completed on 2026-09-05."
+        )
+        task_row = _make_task_row()
+        result_row = _make_result_row(
+            actual_start_date="2026-09-01",
+            actual_end_date="2026-09-05",
+        )
+        mock_db = _mock_db_for_process(update_row, [task_row], result_row)
+        provider = self._make_stub_provider(
+            actual_start_date="2026-09-01",
+            actual_end_date="2026-09-05",
+        )
+
+        result = process_site_update(mock_db, SAMPLE_UPDATE_ID, provider=provider)
+
+        # Check DB insert parameters received actual dates
+        insert_call = mock_db.execute.call_args_list[3]
+        params = insert_call[0][1]
+        self.assertEqual(params["actual_start_date"], "2026-09-01")
+        self.assertEqual(params["actual_end_date"], "2026-09-05")
+
+        # Check return dict
+        self.assertEqual(result["actual_start_date"], "2026-09-01")
+        self.assertEqual(result["actual_end_date"], "2026-09-05")
 
     def test_process_site_update_not_found_raises(self):
         mock_db = MagicMock()

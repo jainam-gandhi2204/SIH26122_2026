@@ -22,6 +22,7 @@ AI_PROVIDER from the environment (default: "mock").
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import os
@@ -109,12 +110,115 @@ _STATUS_KEYWORDS: dict[str, str] = {
     "stopp": "blocked",
 }
 
-_PROGRESS_PATTERNS: list[tuple[re.Pattern, float]] = [
+_PROGRESS_PATTERNS: list[tuple[re.Pattern[str], float | None]] = [
     (re.compile(r"(\d+)\s*%\s*(?:complete|done|finish|progress)", re.I), None),
     (re.compile(r"(?:complete|done|finish)[^\d]*(\d+)\s*%", re.I), None),
 ]
 
 _MOCK_MODEL_NAME = "mock-keyword-v1"
+
+_MONTHS_PATTERN = (
+    r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+    r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+)
+
+_DATE_TOKEN_PATTERN = (
+    r"(?:"
+    r"\d{4}[-/]\d{1,2}[-/]\d{1,2}"
+    r"|\d{1,2}[-/]\d{1,2}[-/]\d{4}"
+    rf"|\d{{1,2}}(?:st|nd|rd|th)?[-/\s]+{_MONTHS_PATTERN}[-/\s,]+\d{{4}}"
+    rf"|{_MONTHS_PATTERN}\s+\d{{1,2}}(?:st|nd|rd|th)?,?\s+\d{{4}}"
+    r")"
+)
+
+_START_DATE_RE = re.compile(
+    rf"(?<!planned\s)(?<!target\s)\b(?:started|commenced|began|start\s*date|commencement\s*date|actual\s*start(?:\s*date)?)\b\s*(?:on|:|at|-|\bas of\b)?\s*(?P<date>{_DATE_TOKEN_PATTERN})",
+    re.IGNORECASE,
+)
+
+_END_DATE_RE = re.compile(
+    rf"(?<!planned\s)(?<!target\s)\b(?:completed|finished|ended|completion\s*date|end\s*date|actual\s*end(?:\s*date)?)\b\s*(?:on|:|at|-|\bas of\b)?\s*(?P<date>{_DATE_TOKEN_PATTERN})",
+    re.IGNORECASE,
+)
+
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+_DATE_PARSE_FORMATS = (
+    "%Y-%m-%d",
+    "%Y/%m/%d",
+    "%d-%m-%Y",
+    "%d/%m/%Y",
+    "%d-%b-%Y",
+    "%d-%B-%Y",
+    "%d %b %Y",
+    "%d %B %Y",
+    "%b %d, %Y",
+    "%B %d, %Y",
+    "%b %d %Y",
+    "%B %d %Y",
+    "%d %b, %Y",
+    "%d %B, %Y",
+)
+
+
+def _parse_explicit_date(date_str: str) -> str | None:
+    """Parse an explicitly stated date string into ISO YYYY-MM-DD format.
+
+    Returns None if the date cannot be parsed or represents an invalid
+    calendar date (e.g. Feb 31).
+    """
+    if not date_str:
+        return None
+    cleaned = re.sub(r"(\d+)(?:st|nd|rd|th)\b", r"\1", date_str.strip())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    if _ISO_DATE_RE.match(cleaned):
+        try:
+            return datetime.date.fromisoformat(cleaned).isoformat()
+        except ValueError:
+            return None
+
+    for fmt in _DATE_PARSE_FORMATS:
+        try:
+            dt = datetime.datetime.strptime(cleaned, fmt)
+            return dt.date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def _extract_start_date(text: str) -> str | None:
+    """Extract actual start date from text if explicitly stated, else None."""
+    matches = list(_START_DATE_RE.finditer(text))
+    if not matches:
+        return None
+    for m in matches:
+        if "actual" in m.group(0).lower():
+            parsed = _parse_explicit_date(m.group("date"))
+            if parsed:
+                return parsed
+    for m in matches:
+        parsed = _parse_explicit_date(m.group("date"))
+        if parsed:
+            return parsed
+    return None
+
+
+def _extract_end_date(text: str) -> str | None:
+    """Extract actual completion / end date from text if explicitly stated, else None."""
+    matches = list(_END_DATE_RE.finditer(text))
+    if not matches:
+        return None
+    for m in matches:
+        if "actual" in m.group(0).lower():
+            parsed = _parse_explicit_date(m.group("date"))
+            if parsed:
+                return parsed
+    for m in matches:
+        parsed = _parse_explicit_date(m.group("date"))
+        if parsed:
+            return parsed
+    return None
 
 
 class MockAIProvider(AIProvider):
@@ -191,9 +295,9 @@ class MockAIProvider(AIProvider):
                         delay_reason = reason
                     break
 
-        # --- Actual dates (UNKNOWN unless explicitly stated – hard to parse reliably) ---
-        actual_start_date: str | None = None
-        actual_end_date: str | None = None
+        # --- Actual dates (FACT: only when explicitly stated in text) ---
+        actual_start_date: str | None = _extract_start_date(raw_update)
+        actual_end_date: str | None = _extract_end_date(raw_update)
 
         # --- Build result ---
         model_response: dict[str, Any] = {
@@ -204,6 +308,8 @@ class MockAIProvider(AIProvider):
                     (k for k in _STATUS_KEYWORDS if k in text_lower), None
                 ),
                 "percent_pattern_found": pct_match is not None,
+                "start_date_found": actual_start_date is not None,
+                "end_date_found": actual_end_date is not None,
             },
             "note": (
                 "Deterministic keyword heuristic. "
@@ -476,8 +582,6 @@ class GeminiAIProvider(AIProvider):
 # Parsing helpers (used by GeminiAIProvider only)
 # ---------------------------------------------------------------------------
 
-_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-
 # Matches an optional ```json … ``` or ``` … ``` fence around a JSON object/array.
 _FENCE_RE = re.compile(
     r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```",
@@ -573,9 +677,12 @@ def _safe_int(value: Any) -> int | None:
 
 
 def _safe_iso_date(value: Any) -> str | None:
-    """Return a YYYY-MM-DD string if it matches that format, or None."""
+    """Return a YYYY-MM-DD string if it matches that format and is a valid calendar date, or None."""
     s = _safe_str(value)
     if s and _ISO_DATE_RE.match(s):
-        return s
+        try:
+            return datetime.date.fromisoformat(s).isoformat()
+        except ValueError:
+            return None
     return None
 
