@@ -1,4 +1,4 @@
-﻿"""Tests for app/schedule_linker.py.
+"""Tests for app/schedule_linker.py.
 
 The dataset mirrors the requirement spec:
   T102 -> T103 -> T104
@@ -560,6 +560,93 @@ class LinkedTasksEndpointTests(unittest.TestCase):
         mock_fn.side_effect = OperationalError("fail", None, None)
         resp = self.client.get("/schedule/tasks/linked")
         self.assertEqual(resp.status_code, 503)
+
+    @patch("app.main.schedule_linker.get_task")
+    def test_get_task_endpoint_returns_200(self, mock_fn):
+        mock_fn.return_value = {
+            "task_id": T101_ID,
+            "source_task_id": "T101",
+            "activity": "Site Preparation",
+            "location": "Well Pad A",
+            "planned_start": "2026-09-01",
+            "planned_end": "2026-09-05",
+            "progress_percent": 100.0,
+            "status": "completed",
+            "delay_days": None,
+            "actual_start_date": "2026-09-01",
+            "actual_end_date": "2026-09-05",
+            "confidence_score": 80.0,
+            "processed_at": "2026-09-05T12:00:00",
+        }
+        resp = self.client.get(f"/schedule/tasks/{T101_ID}")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["source_task_id"], "T101")
+        self.assertEqual(body["planned_start"], "2026-09-01")
+        self.assertEqual(body["actual_start_date"], "2026-09-01")
+        self.assertEqual(body["actual_end_date"], "2026-09-05")
+        self.assertEqual(body["progress_percent"], 100.0)
+        self.assertEqual(body["status"], "completed")
+
+    @patch("app.main.schedule_linker.get_task")
+    def test_get_task_endpoint_returns_404_when_not_found(self, mock_fn):
+        mock_fn.return_value = None
+        resp = self.client.get(f"/schedule/tasks/{T101_ID}")
+        self.assertEqual(resp.status_code, 404)
+
+    @patch("app.main.schedule_linker.get_task")
+    def test_get_task_endpoint_db_error_returns_503(self, mock_fn):
+        from sqlalchemy.exc import OperationalError
+        mock_fn.side_effect = OperationalError("fail", None, Exception("fail"))
+        resp = self.client.get(f"/schedule/tasks/{T101_ID}")
+        self.assertEqual(resp.status_code, 503)
+
+
+# ---------------------------------------------------------------------------
+# get_task (planned vs actual state) tests
+# ---------------------------------------------------------------------------
+
+class GetTaskUnitTests(unittest.TestCase):
+
+    def test_get_task_returns_planned_vs_actual(self):
+        """get_task returns both planned baseline dates and actual state."""
+        row = _make_task_row(
+            tid=T101_ID,
+            source_id="T101",
+            status="in_progress",
+            progress=40.0,
+            delay=None,
+        )
+        row.actual_start_date = "2026-09-01"
+        row.actual_end_date = None
+
+        db = MagicMock()
+        db.execute.return_value.fetchone.return_value = row
+
+        from app.schedule_linker import get_task
+        task = get_task(db, T101_ID)
+
+        self.assertIsNotNone(task)
+        assert task is not None
+        self.assertEqual(task["task_id"], T101_ID)
+        self.assertEqual(task["source_task_id"], "T101")
+        # Baseline planned dates preserved
+        self.assertEqual(task["planned_start"], "2026-09-01")
+        self.assertEqual(task["planned_end"], "2026-09-10")
+        # Actual state reflected
+        self.assertEqual(task["actual_start_date"], "2026-09-01")
+        self.assertIsNone(task["actual_end_date"])
+        self.assertEqual(task["progress_percent"], 40.0)
+        self.assertEqual(task["status"], "in_progress")
+
+    def test_get_task_returns_none_when_task_not_found(self):
+        """get_task returns None when the task UUID is not found."""
+        db = MagicMock()
+        db.execute.return_value.fetchone.return_value = None
+
+        from app.schedule_linker import get_task
+        task = get_task(db, "nonexistent-id")
+        self.assertIsNone(task)
 
 
 if __name__ == "__main__":

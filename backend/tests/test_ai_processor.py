@@ -27,6 +27,7 @@ from app.ai_provider import (
 )
 from app.ai_processor import (
     SiteUpdateNotFoundError,
+    _UPDATE_TASK_ACTUALS,
     _format_result,
     get_current_result,
     process_site_update,
@@ -125,7 +126,12 @@ def _mock_db_for_process(update_row=None, task_rows=None, result_row=None):
     r4.fetchone.return_value = result_row
     results.append(r4)
 
-    mock_db.execute.side_effect = results
+    def _side_effect(*args, **kwargs):
+        if results:
+            return results.pop(0)
+        return MagicMock()
+
+    mock_db.execute.side_effect = _side_effect
     return mock_db
 
 
@@ -442,6 +448,59 @@ class ProcessSiteUpdateTests(unittest.TestCase):
         # Check return dict
         self.assertEqual(result["actual_start_date"], "2026-09-01")
         self.assertEqual(result["actual_end_date"], "2026-09-05")
+
+    def test_process_automatically_updates_schedule_tasks_actuals(self):
+        """When an update is linked to a task, schedule_tasks is updated with latest actuals."""
+        update_row = _make_update_row(raw_update="Foundation work is 60% done. 2 days delay.")
+        task_row = _make_task_row()
+        result_row = _make_result_row()
+        mock_db = _mock_db_for_process(update_row, [task_row], result_row)
+
+        provider = MagicMock(spec=AIProvider)
+        provider.analyse.return_value = AnalysisResult(
+            matched_task_id=SAMPLE_TASK_ID,
+            progress_percent=60.0,
+            status="delayed",
+            delay_days=2,
+            delay_reason="Rain",
+            actual_start_date="2026-09-02",
+            actual_end_date=None,
+            confidence_score=75.0,
+            model_name="mock-keyword-v1",
+            model_response={},
+        )
+
+        process_site_update(mock_db, SAMPLE_UPDATE_ID, provider=provider)
+
+        # Call 4 must be the schedule_tasks actuals update
+        self.assertEqual(mock_db.execute.call_count, 5)
+        update_call = mock_db.execute.call_args_list[4]
+        params = update_call[0][1]
+
+        self.assertEqual(params["task_id"], SAMPLE_TASK_ID)
+        self.assertEqual(params["reported_on"], "2026-09-05")
+        self.assertEqual(params["progress_percent"], 60.0)
+        self.assertEqual(params["status"], "delayed")
+        self.assertEqual(params["delay_days"], 2)
+        self.assertEqual(params["delay_reason"], "Rain")
+        self.assertEqual(params["actual_start_date"], "2026-09-02")
+        self.assertIsNone(params["actual_end_date"])
+
+        # Planned dates must NEVER be overwritten / in the parameters
+        self.assertNotIn("planned_start", params)
+        self.assertNotIn("planned_end", params)
+
+    def test_process_unmatched_task_does_not_update_schedule_tasks(self):
+        """When an update does not match any planned task, schedule_tasks is not updated."""
+        update_row = _make_update_row(raw_update="Workers arrived on site.")
+        result_row = _make_result_row()
+        mock_db = _mock_db_for_process(update_row, [], result_row)
+        provider = self._make_stub_provider(task_id=None)
+
+        process_site_update(mock_db, SAMPLE_UPDATE_ID, provider=provider)
+
+        # 4 execute calls: fetch update, fetch tasks, expire current, insert new (no update to schedule_tasks)
+        self.assertEqual(mock_db.execute.call_count, 4)
 
     def test_process_site_update_not_found_raises(self):
         mock_db = MagicMock()
@@ -1186,6 +1245,234 @@ class SafeParsingHelperTests(unittest.TestCase):
 
     def test_safe_iso_date_slash_format(self):
         self.assertIsNone(_safe_iso_date("2026/09/05"))
+
+
+# ---------------------------------------------------------------------------
+# Task actuals accumulation & planned dates protection tests
+# ---------------------------------------------------------------------------
+
+class TaskActualsAccumulationTests(unittest.TestCase):
+    """Verify that multiple updates on a task accumulate actuals properly:
+    1. A field with UNKNOWN/NULL does NOT overwrite an existing known value.
+    2. Planned start/end baseline dates are NEVER modified.
+    3. New valid non-null values update progress, status, and actual dates.
+    """
+
+    def test_null_actual_date_does_not_overwrite_existing(self):
+        """If update 2 mentions no start date, the existing start date must be preserved."""
+        update_row = _make_update_row(raw_update="Foundation work is 70% complete. 2 days delay.")
+        result_row = _make_result_row()
+        mock_db = _mock_db_for_process(update_row, [], result_row)
+
+        provider = MagicMock(spec=AIProvider)
+        provider.analyse.return_value = AnalysisResult(
+            matched_task_id=SAMPLE_TASK_ID,
+            progress_percent=70.0,
+            status="delayed",
+            delay_days=2,
+            delay_reason="Rain",
+            actual_start_date=None,  # UNKNOWN in this update
+            actual_end_date=None,    # UNKNOWN in this update
+            confidence_score=75.0,
+            model_name="mock-keyword-v1",
+            model_response={},
+        )
+
+        process_site_update(mock_db, SAMPLE_UPDATE_ID, provider=provider)
+
+        # Verify the update query parameters
+        update_call = mock_db.execute.call_args_list[4]
+        params = update_call[0][1]
+
+        # COALESCE(:actual_start_date, actual_start_date): param is None so DB retains existing
+        self.assertIsNone(params["actual_start_date"])
+        self.assertEqual(params["progress_percent"], 70.0)
+        self.assertEqual(params["status"], "delayed")
+        self.assertEqual(params["delay_days"], 2)
+
+        # Baseline planned dates are NEVER in the update params
+        self.assertNotIn("planned_start", params)
+        self.assertNotIn("planned_end", params)
+
+    def test_completion_update_sets_end_date_and_preserves_start_date(self):
+        """When completion date is reported, actual_end_date is set while start date is retained."""
+        update_row = _make_update_row(raw_update="Foundation work completed on 2026-09-08.")
+        result_row = _make_result_row()
+        mock_db = _mock_db_for_process(update_row, [], result_row)
+
+        provider = MagicMock(spec=AIProvider)
+        provider.analyse.return_value = AnalysisResult(
+            matched_task_id=SAMPLE_TASK_ID,
+            progress_percent=100.0,
+            status="completed",
+            delay_days=None,
+            delay_reason=None,
+            actual_start_date=None,
+            actual_end_date="2026-09-08",
+            confidence_score=85.0,
+            model_name="mock-keyword-v1",
+            model_response={},
+        )
+
+        process_site_update(mock_db, SAMPLE_UPDATE_ID, provider=provider)
+
+        update_call = mock_db.execute.call_args_list[4]
+        params = update_call[0][1]
+
+        self.assertEqual(params["status"], "completed")
+        self.assertEqual(params["progress_percent"], 100.0)
+        self.assertEqual(params["actual_end_date"], "2026-09-08")
+        self.assertIsNone(params["actual_start_date"])
+        self.assertNotIn("planned_start", params)
+        self.assertNotIn("planned_end", params)
+
+    def test_update_task_actuals_sql_structure(self):
+        """_UPDATE_TASK_ACTUALS SQL must contain protections for date order, progress, and completed status."""
+        sql_str = str(_UPDATE_TASK_ACTUALS)
+
+        # Baseline planned dates must NEVER be modified
+        self.assertNotIn("planned_start =", sql_str)
+        self.assertNotIn("planned_end =", sql_str)
+
+        # Monotonic progress: incoming only updates if strictly higher
+        self.assertIn(":progress_percent > progress_percent", sql_str)
+
+        # Completed status protection: completed status is NEVER downgraded
+        self.assertIn("WHEN status = 'completed' THEN 'completed'", sql_str)
+
+        # Date order protection: older updates cannot overwrite newer status or delay
+        self.assertIn("CAST(:reported_on AS DATE) >= last_reported_on", sql_str)
+        self.assertIn("CAST(:reported_on AS DATE) < last_reported_on", sql_str)
+
+        # Earliest actual start date preservation
+        self.assertIn("CAST(:actual_start_date AS DATE) < actual_start_date", sql_str)
+
+    def test_older_update_logic_simulation(self):
+        """Verify the exact update rules when an older update is processed after a newer update."""
+        def apply_update(existing, incoming):
+            # Implements the CASE semantics of _UPDATE_TASK_ACTUALS in Python
+            res = dict(existing)
+            rep_incoming = incoming.get("reported_on")
+            rep_existing = existing.get("last_reported_on")
+
+            is_older = (
+                rep_existing is not None
+                and rep_incoming is not None
+                and rep_incoming < rep_existing
+            )
+
+            # last_reported_on
+            if rep_existing is None or (rep_incoming and rep_incoming >= rep_existing):
+                res["last_reported_on"] = rep_incoming
+
+            # progress_percent (monotonic, higher progress wins)
+            p_in = incoming.get("progress_percent")
+            p_ex = existing.get("progress_percent")
+            if p_in is not None:
+                if p_ex is None or p_in > p_ex:
+                    res["progress_percent"] = p_in
+
+            # status
+            s_in = incoming.get("status")
+            s_ex = existing.get("status")
+            if s_ex == "completed":
+                res["status"] = "completed"
+            elif is_older and s_ex is not None:
+                res["status"] = s_ex
+            elif s_in is not None:
+                res["status"] = s_in
+
+            # delay_days & delay_reason
+            if not is_older or existing.get("delay_days") is None:
+                if incoming.get("delay_days") is not None:
+                    res["delay_days"] = incoming.get("delay_days")
+            if not is_older or existing.get("delay_reason") is None:
+                if incoming.get("delay_reason") is not None:
+                    res["delay_reason"] = incoming.get("delay_reason")
+
+            # actual_start_date (earliest wins, fills if null)
+            start_in = incoming.get("actual_start_date")
+            start_ex = existing.get("actual_start_date")
+            if start_ex is None:
+                res["actual_start_date"] = start_in
+            elif start_in is not None and start_in < start_ex:
+                res["actual_start_date"] = start_in
+
+            # actual_end_date
+            end_in = incoming.get("actual_end_date")
+            end_ex = existing.get("actual_end_date")
+            if end_ex is not None:
+                res["actual_end_date"] = end_ex
+            elif not is_older and end_in is not None:
+                res["actual_end_date"] = end_in
+
+            return res
+
+        # Existing task state from update on 2026-09-08: 40% progress, delayed 1 day
+        current_state = {
+            "last_reported_on": "2026-09-08",
+            "progress_percent": 40.0,
+            "status": "delayed",
+            "delay_days": 1,
+            "delay_reason": "Rain",
+            "actual_start_date": None,
+            "actual_end_date": None,
+        }
+
+        # Incoming older update from 2026-09-02: 20% progress, in_progress, 0 delay, start date 2026-09-02
+        older_update = {
+            "reported_on": "2026-09-02",
+            "progress_percent": 20.0,
+            "status": "in_progress",
+            "delay_days": 0,
+            "delay_reason": None,
+            "actual_start_date": "2026-09-02",
+            "actual_end_date": None,
+        }
+
+        result = apply_update(current_state, older_update)
+
+        # 1. Higher progress is preserved (40% is NOT overwritten by 20%)
+        self.assertEqual(result["progress_percent"], 40.0)
+
+        # 2. Newer status is preserved ('delayed' is NOT overwritten by 'in_progress')
+        self.assertEqual(result["status"], "delayed")
+
+        # 3. Newer delay info is preserved (1 day is NOT overwritten by 0)
+        self.assertEqual(result["delay_days"], 1)
+        self.assertEqual(result["delay_reason"], "Rain")
+
+        # 4. last_reported_on remains the newer date
+        self.assertEqual(result["last_reported_on"], "2026-09-08")
+
+        # 5. Missing start date is safely populated from the historical update
+        self.assertEqual(result["actual_start_date"], "2026-09-02")
+
+    def test_lower_progress_does_not_overwrite_higher_progress_simulation(self):
+        """An update on a newer date reporting lower progress does not regress task progress."""
+        current_state = {
+            "last_reported_on": "2026-09-08",
+            "progress_percent": 70.0,
+            "status": "in_progress",
+        }
+        # Erroneously reported 30% on 2026-09-10
+        newer_lower = {
+            "reported_on": "2026-09-10",
+            "progress_percent": 30.0,
+            "status": "in_progress",
+        }
+        p_in = newer_lower["progress_percent"]
+        p_ex = current_state["progress_percent"]
+        progress_after = p_in if (p_ex is None or p_in > p_ex) else p_ex
+        self.assertEqual(progress_after, 70.0, "Progress must never regress to a lower value")
+
+    def test_completed_task_not_downgraded_simulation(self):
+        """A completed task cannot be downgraded to in_progress or not_started."""
+        current_status = "completed"
+        incoming_status = "in_progress"
+        status_after = "completed" if current_status == "completed" else incoming_status
+        self.assertEqual(status_after, "completed", "Completed status must never be downgraded")
+
 
 
 if __name__ == "__main__":

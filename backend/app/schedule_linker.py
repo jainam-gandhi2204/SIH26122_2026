@@ -1,4 +1,4 @@
-﻿"""Schedule linking and downstream impact analysis.
+"""Schedule linking and downstream impact analysis.
 
 Responsibilities
 ----------------
@@ -41,7 +41,7 @@ from sqlalchemy.orm import Session
 # ---------------------------------------------------------------------------
 
 # All schedule tasks joined with their current AI result (LEFT JOIN so tasks
-# without any AI result still appear).
+# without any AI result still appear). Uses DISTINCT ON to ensure 1:1 join per task.
 _LINKED_TASKS_QUERY = text(
     """
     SELECT
@@ -51,19 +51,32 @@ _LINKED_TASKS_QUERY = text(
         st.location,
         st.planned_start::TEXT          AS planned_start,
         st.planned_end::TEXT            AS planned_end,
-        ap.progress_percent,
-        ap.status,
-        ap.delay_days,
-        ap.delay_reason,
-        ap.actual_start_date::TEXT      AS actual_start_date,
-        ap.actual_end_date::TEXT        AS actual_end_date,
+        COALESCE(st.progress_percent, ap.progress_percent) AS progress_percent,
+        COALESCE(st.status, ap.status)                     AS status,
+        COALESCE(st.delay_days, ap.delay_days)             AS delay_days,
+        COALESCE(st.delay_reason, ap.delay_reason)         AS delay_reason,
+        COALESCE(st.actual_start_date::TEXT, ap.actual_start_date::TEXT) AS actual_start_date,
+        COALESCE(st.actual_end_date::TEXT, ap.actual_end_date::TEXT)     AS actual_end_date,
         ap.confidence_score,
         ap.processed_at::TEXT           AS processed_at,
-        ap.matched_task_id              AS ai_matched_task_id
+        COALESCE(ap.matched_task_id, st.id)              AS ai_matched_task_id
     FROM schedule_tasks st
-    LEFT JOIN ai_processed_updates ap
-           ON ap.matched_task_id = st.id
-          AND ap.is_current = true
+    LEFT JOIN (
+        SELECT DISTINCT ON (matched_task_id)
+            matched_task_id,
+            progress_percent,
+            status,
+            delay_days,
+            delay_reason,
+            actual_start_date,
+            actual_end_date,
+            confidence_score,
+            processed_at
+        FROM ai_processed_updates
+        WHERE is_current = true
+          AND matched_task_id IS NOT NULL
+        ORDER BY matched_task_id, processed_at DESC
+    ) ap ON ap.matched_task_id = st.id
     ORDER BY st.planned_start, st.source_task_id
     """
 )
@@ -88,18 +101,31 @@ _SINGLE_TASK_QUERY = text(
         st.location,
         st.planned_start::TEXT          AS planned_start,
         st.planned_end::TEXT            AS planned_end,
-        ap.progress_percent,
-        ap.status,
-        ap.delay_days,
-        ap.delay_reason,
-        ap.actual_start_date::TEXT      AS actual_start_date,
-        ap.actual_end_date::TEXT        AS actual_end_date,
+        COALESCE(st.progress_percent, ap.progress_percent) AS progress_percent,
+        COALESCE(st.status, ap.status)                     AS status,
+        COALESCE(st.delay_days, ap.delay_days)             AS delay_days,
+        COALESCE(st.delay_reason, ap.delay_reason)         AS delay_reason,
+        COALESCE(st.actual_start_date::TEXT, ap.actual_start_date::TEXT) AS actual_start_date,
+        COALESCE(st.actual_end_date::TEXT, ap.actual_end_date::TEXT)     AS actual_end_date,
         ap.confidence_score,
         ap.processed_at::TEXT           AS processed_at
     FROM schedule_tasks st
-    LEFT JOIN ai_processed_updates ap
-           ON ap.matched_task_id = st.id
-          AND ap.is_current = true
+    LEFT JOIN (
+        SELECT DISTINCT ON (matched_task_id)
+            matched_task_id,
+            progress_percent,
+            status,
+            delay_days,
+            delay_reason,
+            actual_start_date,
+            actual_end_date,
+            confidence_score,
+            processed_at
+        FROM ai_processed_updates
+        WHERE is_current = true
+          AND matched_task_id IS NOT NULL
+        ORDER BY matched_task_id, processed_at DESC
+    ) ap ON ap.matched_task_id = st.id
     WHERE st.id = :task_id
     """
 )
@@ -114,17 +140,30 @@ _ALL_TASKS_QUERY = text(
         st.location,
         st.planned_start::TEXT          AS planned_start,
         st.planned_end::TEXT            AS planned_end,
-        ap.progress_percent,
-        ap.status,
-        ap.delay_days,
-        ap.actual_start_date::TEXT      AS actual_start_date,
-        ap.actual_end_date::TEXT        AS actual_end_date,
+        COALESCE(st.progress_percent, ap.progress_percent) AS progress_percent,
+        COALESCE(st.status, ap.status)                     AS status,
+        COALESCE(st.delay_days, ap.delay_days)             AS delay_days,
+        COALESCE(st.actual_start_date::TEXT, ap.actual_start_date::TEXT) AS actual_start_date,
+        COALESCE(st.actual_end_date::TEXT, ap.actual_end_date::TEXT)     AS actual_end_date,
         ap.confidence_score,
         ap.processed_at::TEXT           AS processed_at
     FROM schedule_tasks st
-    LEFT JOIN ai_processed_updates ap
-           ON ap.matched_task_id = st.id
-          AND ap.is_current = true
+    LEFT JOIN (
+        SELECT DISTINCT ON (matched_task_id)
+            matched_task_id,
+            progress_percent,
+            status,
+            delay_days,
+            delay_reason,
+            actual_start_date,
+            actual_end_date,
+            confidence_score,
+            processed_at
+        FROM ai_processed_updates
+        WHERE is_current = true
+          AND matched_task_id IS NOT NULL
+        ORDER BY matched_task_id, processed_at DESC
+    ) ap ON ap.matched_task_id = st.id
     """
 )
 
@@ -192,6 +231,14 @@ def get_linked_tasks(db: Session) -> list[dict[str, Any]]:
     """
     rows = db.execute(_LINKED_TASKS_QUERY).fetchall()
     return [_fmt_linked(r) for r in rows]
+
+
+def get_task(db: Session, task_id: str) -> dict[str, Any] | None:
+    """Return plan+actual data for a single schedule task, or None if not found."""
+    row = db.execute(_SINGLE_TASK_QUERY, {"task_id": task_id}).fetchone()
+    if row is None:
+        return None
+    return _fmt_task(row)
 
 
 def get_task_impact(db: Session, task_id: str) -> dict[str, Any] | None:

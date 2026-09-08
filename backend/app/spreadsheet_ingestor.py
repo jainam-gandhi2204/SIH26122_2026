@@ -1,4 +1,4 @@
-﻿"""Spreadsheet ingestion for site updates.
+"""Spreadsheet ingestion for site updates.
 
 Accepts CSV or XLSX file content and converts each data row into a
 SiteUpdateCreate object ready to be stored via the existing
@@ -226,6 +226,14 @@ def _read_xlsx(
         return None
 
     ws = wb.active
+    if ws is None:
+        result.row_errors.append(RowError(
+            row_number=1,
+            source_update_id="",
+            message="No active worksheet found in workbook.",
+        ))
+        wb.close()
+        return None
     raw_rows = list(ws.iter_rows(values_only=True))
     wb.close()
 
@@ -295,7 +303,7 @@ _REQUIRED_FIELDS = frozenset({"source_update_id", "reported_on", "location", "ra
 def _check_required_columns(col_map: dict[str, str]) -> set[str]:
     """Return the set of required canonical fields not present in col_map."""
     present = set(col_map.values())
-    return _REQUIRED_FIELDS - present
+    return set(_REQUIRED_FIELDS - present)
 
 
 # ---------------------------------------------------------------------------

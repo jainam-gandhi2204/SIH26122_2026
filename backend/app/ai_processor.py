@@ -1,4 +1,4 @@
-﻿"""AI processing orchestration layer.
+"""AI processing orchestration layer.
 
 Responsibilities
 ----------------
@@ -54,6 +54,49 @@ _EXPIRE_CURRENT = text(
     SET is_current = false
     WHERE site_update_id = :site_update_id
       AND is_current = true
+    """
+)
+
+_UPDATE_TASK_ACTUALS = text(
+    """
+    UPDATE schedule_tasks
+    SET
+        last_reported_on = CASE
+            WHEN last_reported_on IS NULL OR CAST(:reported_on AS DATE) >= last_reported_on THEN CAST(:reported_on AS DATE)
+            ELSE last_reported_on
+        END,
+        progress_percent = CASE
+            WHEN :progress_percent IS NULL THEN progress_percent
+            WHEN progress_percent IS NULL THEN :progress_percent
+            WHEN :progress_percent > progress_percent THEN :progress_percent
+            ELSE progress_percent
+        END,
+        status = CASE
+            WHEN status = 'completed' THEN 'completed'
+            WHEN last_reported_on IS NOT NULL AND CAST(:reported_on AS DATE) < last_reported_on AND status IS NOT NULL THEN status
+            ELSE COALESCE(:status, status)
+        END,
+        delay_days = CASE
+            WHEN last_reported_on IS NOT NULL AND CAST(:reported_on AS DATE) < last_reported_on AND delay_days IS NOT NULL THEN delay_days
+            ELSE COALESCE(:delay_days, delay_days)
+        END,
+        delay_reason = CASE
+            WHEN last_reported_on IS NOT NULL AND CAST(:reported_on AS DATE) < last_reported_on AND delay_reason IS NOT NULL THEN delay_reason
+            ELSE COALESCE(:delay_reason, delay_reason)
+        END,
+        actual_start_date = CASE
+            WHEN actual_start_date IS NULL THEN CAST(:actual_start_date AS DATE)
+            WHEN :actual_start_date IS NULL THEN actual_start_date
+            WHEN CAST(:actual_start_date AS DATE) < actual_start_date THEN CAST(:actual_start_date AS DATE)
+            ELSE actual_start_date
+        END,
+        actual_end_date = CASE
+            WHEN actual_end_date IS NOT NULL THEN actual_end_date
+            WHEN last_reported_on IS NOT NULL AND CAST(:reported_on AS DATE) < last_reported_on THEN actual_end_date
+            ELSE COALESCE(CAST(:actual_end_date AS DATE), actual_end_date)
+        END,
+        updated_at = now()
+    WHERE id = :task_id
     """
 )
 
@@ -259,6 +302,25 @@ def process_site_update(
             "model_response": json.dumps(result.model_response),
         },
     ).fetchone()
+
+    # 6. If matched to a planned task, automatically update schedule_tasks actuals
+    #    (baseline planned dates planned_start/planned_end are NEVER overwritten;
+    #     existing known values are never overwritten with NULL/UNKNOWN;
+    #     older/lower-progress updates do not overwrite newer/higher-progress actuals)
+    if result.matched_task_id:
+        db.execute(
+            _UPDATE_TASK_ACTUALS,
+            {
+                "task_id": result.matched_task_id,
+                "reported_on": reported_on_str,
+                "progress_percent": result.progress_percent,
+                "status": result.status,
+                "delay_days": result.delay_days,
+                "delay_reason": result.delay_reason,
+                "actual_start_date": result.actual_start_date,
+                "actual_end_date": result.actual_end_date,
+            },
+        )
 
     db.commit()
     return _format_result(inserted_row)

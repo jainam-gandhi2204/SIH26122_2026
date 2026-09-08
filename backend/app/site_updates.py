@@ -1,4 +1,4 @@
-﻿"""Site updates ingestion: validation, queries, and database persistence.
+"""Site updates ingestion: validation, queries, and database persistence.
 
 Kept separate from main.py so validation and persistence can be unit-tested cleanly.
 """
@@ -61,7 +61,7 @@ def format_site_update(row: Any) -> dict[str, Any]:
         reported_on_str = str(reported_on_val)
 
     ingested_at_val = getattr(row, "ingested_at", None)
-    if hasattr(ingested_at_val, "isoformat"):
+    if ingested_at_val is not None and hasattr(ingested_at_val, "isoformat"):
         ingested_at_str = ingested_at_val.isoformat()
     elif ingested_at_val is not None:
         ingested_at_str = str(ingested_at_val)

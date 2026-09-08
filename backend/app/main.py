@@ -312,6 +312,31 @@ def list_linked_tasks(db: Session = Depends(get_db)) -> list[dict]:
         ) from error
 
 
+@app.get("/schedule/tasks/{task_id}", tags=["schedule"])
+def get_schedule_task(
+    task_id: str,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Return a single schedule task with its planned vs actual state.
+
+    Returns 404 if task_id does not exist.
+    """
+    try:
+        result = schedule_linker.get_task(db, task_id)
+    except SQLAlchemyError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database is unavailable",
+        ) from error
+
+    if result is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Task '{task_id}' not found.",
+        )
+    return result
+
+
 @app.get("/schedule/tasks/{task_id}/impact", tags=["schedule"])
 def get_task_impact(
     task_id: str,
