@@ -313,6 +313,23 @@ def list_linked_tasks(db: Session = Depends(get_db)) -> list[dict]:
         ) from error
 
 
+@app.get("/schedule/deviation", tags=["schedule"])
+@app.get("/schedule/tasks/deviation", tags=["schedule"])
+def get_schedule_deviation(db: Session = Depends(get_db)) -> dict:
+    """Return actual-vs-planned schedule deviation and health classifications.
+
+    Calculates start, end, and duration deviations for all tasks, and classifies
+    tasks as on_time, delayed, at_risk, or unassessed.
+    """
+    try:
+        return schedule_linker.get_schedule_deviation_summary(db)
+    except SQLAlchemyError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database is unavailable",
+        ) from error
+
+
 @app.get("/schedule/tasks/{task_id}", tags=["schedule"])
 def get_schedule_task(
     task_id: str,
