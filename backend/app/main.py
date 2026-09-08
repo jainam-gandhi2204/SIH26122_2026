@@ -1,4 +1,5 @@
-from fastapi import Depends, FastAPI, HTTPException, UploadFile, status
+from fastapi import Depends, FastAPI, HTTPException, Query, UploadFile, status
+from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -12,6 +13,11 @@ from app.ai_processor import SiteUpdateNotFoundError
 from app import spreadsheet_ingestor
 from app import schedule_linker
 from app import review_queue
+from app.review_queue import (
+    InvalidTaskMatchError,
+    ReviewActionError,
+    ReviewItemNotFoundError,
+)
 
 
 app = FastAPI(
@@ -389,29 +395,147 @@ def get_task_impact(
 
 
 # ---------------------------------------------------------------------------
-# Planner Review Queue
+# Planner Review Queue & Resolution Endpoints
 # ---------------------------------------------------------------------------
+
+class ReviewApproveRequest(BaseModel):
+    notes: str | None = Field(None, description="Optional planner notes")
+
+
+class ReviewMatchRequest(BaseModel):
+    task_id: str = Field(..., description="Target schedule task UUID or source_task_id (e.g. T101)")
+    notes: str | None = Field(None, description="Optional planner notes")
+
+
+class ReviewRejectRequest(BaseModel):
+    reason: str | None = Field(None, description="Optional reason for marking update as unmatched/rejected")
+
+
+class ReviewResolveRequest(BaseModel):
+    action: str = Field(..., description="Action to take: 'approve', 'change_match', or 'reject'")
+    task_id: str | None = Field(None, description="Target task ID for 'change_match'")
+    notes: str | None = Field(None, description="Optional notes or rejection reason")
+
 
 @app.get("/review/queue", tags=["review"])
 @app.get("/planner/review-queue", tags=["review"])
 def get_planner_review_queue(
     threshold: float = 70.0,
+    status_filter: str = Query("pending", alias="status", description="Filter by review status: 'pending', 'resolved', or 'all'"),
     db: Session = Depends(get_db),
 ) -> list[dict]:
     """Retrieve site updates requiring planner review.
 
     Includes all AI-processed updates where:
     - matched_task_id is null (no schedule task could be linked), or
-    - confidence_score is below the threshold (default: 70.0).
+    - confidence_score is below the threshold (default: 70.0), or
+    - multiple candidate matches caused ambiguity.
 
     Returns raw update text, extracted activity/progress/status, confidence,
-    review reason, and a suggested match (if available) for planner inspection.
-    Does NOT automatically attach or mutate uncertain matches.
+    review reason, current match, candidate schedule tasks, and suggested match.
     """
     try:
-        return review_queue.get_review_queue(db, threshold=threshold)
+        return review_queue.get_review_queue(db, threshold=threshold, status=status_filter)
     except SQLAlchemyError as error:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Database is unavailable",
         ) from error
+
+
+@app.post("/planner/review-queue/{review_id}/approve", tags=["review"])
+@app.post("/review/queue/{review_id}/approve", tags=["review"])
+def approve_review_item(
+    review_id: str,
+    payload: ReviewApproveRequest | None = None,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Approve the AI or suggested match for an update in the review queue.
+
+    Confirms the match, sets confidence to 100%, and safely updates schedule task
+    actuals using the existing schedule actual engine.
+    """
+    notes = payload.notes if payload else None
+    try:
+        return review_queue.approve_match(db, review_id=review_id, notes=notes)
+    except ReviewItemNotFoundError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+    except ReviewActionError as error:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)) from error
+    except SQLAlchemyError as error:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database is unavailable") from error
+
+
+@app.post("/planner/review-queue/{review_id}/change-match", tags=["review"])
+@app.post("/review/queue/{review_id}/change-match", tags=["review"])
+def change_review_item_match(
+    review_id: str,
+    payload: ReviewMatchRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Reassign the site update to a different schedule task.
+
+    Validates that the target task exists, updates the matched task, and safely
+    applies schedule task actuals to the newly matched task.
+    """
+    try:
+        return review_queue.change_matched_task(db, review_id=review_id, new_task_id=payload.task_id, notes=payload.notes)
+    except ReviewItemNotFoundError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+    except InvalidTaskMatchError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+    except ReviewActionError as error:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)) from error
+    except SQLAlchemyError as error:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database is unavailable") from error
+
+
+@app.post("/planner/review-queue/{review_id}/reject", tags=["review"])
+@app.post("/review/queue/{review_id}/reject", tags=["review"])
+def reject_review_item(
+    review_id: str,
+    payload: ReviewRejectRequest | None = None,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Mark the site update as intentionally unmatched/rejected.
+
+    Sets matched_task_id to NULL, records the rejection audit trail, and does NOT
+    modify any schedule tasks.
+    """
+    reason = payload.reason if payload else None
+    try:
+        return review_queue.reject_match(db, review_id=review_id, reason=reason)
+    except ReviewItemNotFoundError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+    except SQLAlchemyError as error:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database is unavailable") from error
+
+
+@app.post("/planner/review-queue/{review_id}/resolve", tags=["review"])
+@app.post("/review/queue/{review_id}/resolve", tags=["review"])
+def resolve_review_item(
+    review_id: str,
+    payload: ReviewResolveRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Unified resolution endpoint for review queue items ('approve', 'change_match', or 'reject')."""
+    try:
+        return review_queue.resolve_review_item(
+            db,
+            review_id=review_id,
+            action=payload.action,
+            task_id=payload.task_id,
+            notes=payload.notes,
+        )
+    except ReviewItemNotFoundError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+    except InvalidTaskMatchError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+    except ReviewActionError as error:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)) from error
+    except SQLAlchemyError as error:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database is unavailable") from error

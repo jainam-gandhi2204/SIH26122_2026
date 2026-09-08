@@ -15,6 +15,7 @@ caller (main.py) which converts them to HTTP responses.
 
 from __future__ import annotations
 
+import datetime
 import json
 import uuid
 from typing import Any
@@ -308,22 +309,74 @@ def process_site_update(
     #     existing known values are never overwritten with NULL/UNKNOWN;
     #     older/lower-progress updates do not overwrite newer/higher-progress actuals)
     if result.matched_task_id:
-        db.execute(
-            _UPDATE_TASK_ACTUALS,
-            {
-                "task_id": result.matched_task_id,
-                "reported_on": reported_on_str,
-                "progress_percent": result.progress_percent,
-                "status": result.status,
-                "delay_days": result.delay_days,
-                "delay_reason": result.delay_reason,
-                "actual_start_date": result.actual_start_date,
-                "actual_end_date": result.actual_end_date,
-            },
+        update_schedule_task_actuals(
+            db=db,
+            task_id=result.matched_task_id,
+            reported_on=reported_on_str,
+            progress_percent=result.progress_percent,
+            status=result.status,
+            delay_days=result.delay_days,
+            delay_reason=result.delay_reason,
+            actual_start_date=result.actual_start_date,
+            actual_end_date=result.actual_end_date,
         )
 
     db.commit()
     return _format_result(inserted_row)
+
+
+def update_schedule_task_actuals(
+    db: Session,
+    task_id: str,
+    reported_on: str | datetime.date,
+    progress_percent: float | None = None,
+    status: str | None = None,
+    delay_days: int | None = None,
+    delay_reason: str | None = None,
+    actual_start_date: str | datetime.date | None = None,
+    actual_end_date: str | datetime.date | None = None,
+) -> None:
+    """Update schedule_tasks actual tracking columns from an AI-processed site update.
+
+    Guarantees:
+    - Baseline planned dates (planned_start, planned_end) are NEVER modified.
+    - Never invents dates: only applies extracted FACT values.
+    - Existing known values are preserved when incoming value is NULL/UNKNOWN.
+    - Monotonic progress: lower progress does not overwrite higher progress.
+    - Date order protection: older site update cannot overwrite newer status,
+      delays, or end dates.
+    - Completed status cannot be downgraded.
+    - Earliest confirmed actual start date is preserved.
+    """
+    reported_on_str = (
+        reported_on.isoformat()
+        if isinstance(reported_on, (datetime.date, datetime.datetime))
+        else str(reported_on)
+    )
+    start_str = (
+        actual_start_date.isoformat()
+        if isinstance(actual_start_date, (datetime.date, datetime.datetime))
+        else actual_start_date
+    )
+    end_str = (
+        actual_end_date.isoformat()
+        if isinstance(actual_end_date, (datetime.date, datetime.datetime))
+        else actual_end_date
+    )
+
+    db.execute(
+        _UPDATE_TASK_ACTUALS,
+        {
+            "task_id": task_id,
+            "reported_on": reported_on_str,
+            "progress_percent": progress_percent,
+            "status": status,
+            "delay_days": delay_days,
+            "delay_reason": delay_reason,
+            "actual_start_date": start_str,
+            "actual_end_date": end_str,
+        },
+    )
 
 
 def get_current_result(
