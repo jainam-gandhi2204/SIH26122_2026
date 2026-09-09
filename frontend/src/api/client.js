@@ -119,10 +119,21 @@ export async function ingestSiteUpdate({ text, raw_update, reported_date, report
 
   const generatedSourceId = source_update_id || `UPD-${Date.now().toString().slice(-6)}`;
 
+  let resolvedLocation = (location || '').trim();
+  if (!resolvedLocation) {
+    const rawText = text || raw_update || '';
+    const locMatch = rawText.match(/\bat\s+([A-Za-z0-9\s]+?)(?:\s+is|\s+was|\s*\.|\s*,|$)/i);
+    if (locMatch && locMatch[1] && locMatch[1].trim().length < 30) {
+      resolvedLocation = locMatch[1].trim();
+    } else {
+      resolvedLocation = 'Well Pad A';
+    }
+  }
+
   const updatePayload = {
     source_update_id: generatedSourceId,
     raw_update: text || raw_update,
-    location: location || 'Well Pad A',
+    location: resolvedLocation,
     reported_on: formattedDate,
     source_reference: 'Manual Ingestion',
   };

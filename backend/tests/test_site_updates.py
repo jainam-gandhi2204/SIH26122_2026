@@ -1,4 +1,4 @@
-﻿"""Unit tests for the site updates ingestion layer (app/site_updates.py).
+"""Unit tests for the site updates ingestion layer (app/site_updates.py).
 
 All tests are pure unit tests with mocks: no database connection or network needed.
 """

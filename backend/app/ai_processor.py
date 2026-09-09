@@ -39,13 +39,12 @@ _FETCH_SITE_UPDATE = text(
     """
 )
 
-_FETCH_TASKS_BY_LOCATION = text(
+_FETCH_ALL_SCHEDULE_TASKS = text(
     """
     SELECT id, source_task_id, activity, location,
            planned_start::TEXT AS planned_start,
            planned_end::TEXT   AS planned_end
     FROM schedule_tasks
-    WHERE location = :location
     ORDER BY planned_start
     """
 )
@@ -262,11 +261,9 @@ def process_site_update(
         raise SiteUpdateNotFoundError(f"Site update '{update_id}' not found")
     update_id = str(update_row.id)
 
-    # 2. Candidate tasks at the same location
-    task_rows = db.execute(
-        _FETCH_TASKS_BY_LOCATION, {"location": update_row.location}
-    ).fetchall()
-    candidate_tasks = [
+    # 2. Candidate tasks: fetch all schedule tasks and prioritize matching location
+    task_rows = db.execute(_FETCH_ALL_SCHEDULE_TASKS).fetchall()
+    all_candidates = [
         {
             "id": str(row.id),
             "source_task_id": row.source_task_id,
@@ -277,6 +274,17 @@ def process_site_update(
         }
         for row in task_rows
     ]
+
+    loc_clean = (update_row.location or "").strip().lower()
+    raw_lower = (update_row.raw_update or "").lower()
+
+    # Prioritize tasks whose location matches reported location or is mentioned in raw update
+    loc_matched = [
+        t for t in all_candidates
+        if (loc_clean and t.get("location", "").strip().lower() == loc_clean)
+        or (t.get("location", "").strip() and t.get("location", "").strip().lower() in raw_lower)
+    ]
+    candidate_tasks = loc_matched if loc_matched else all_candidates
 
     # 3. Call provider
     reported_on_str = (
@@ -314,11 +322,13 @@ def process_site_update(
         },
     ).fetchone()
 
-    # 6. If matched to a planned task, automatically update schedule_tasks actuals
+    # 6. If matched to a planned task with high confidence (>= 70.0),
+    #    automatically update schedule_tasks actuals.
+    #    Lower-confidence and ambiguous matches are held for planner review.
     #    (baseline planned dates planned_start/planned_end are NEVER overwritten;
     #     existing known values are never overwritten with NULL/UNKNOWN;
     #     older/lower-progress updates do not overwrite newer/higher-progress actuals)
-    if result.matched_task_id:
+    if result.matched_task_id and result.confidence_score >= 70.0:
         update_schedule_task_actuals(
             db=db,
             task_id=result.matched_task_id,

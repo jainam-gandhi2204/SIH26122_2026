@@ -603,5 +603,158 @@ class ReviewQueueApiEndpointTests(unittest.TestCase):
             self.assertIn("Unknown action", resp.json()["detail"])
 
 
+class RegressionScenario2ProjectIsolationTests(unittest.TestCase):
+    """Specific regression tests for Scenario 2 (Project Isolation):
+    - Replace Current Schedule archives previous project pending review items
+    - Old pending items are marked as 'historical' with preserved audit trail
+    - Old review items do NOT appear in the active pending queue (status='pending')
+    - New schedule review items DO appear in the active queue
+    - Historical items can be viewed via status='historical' or status='all'
+    - Historical audit trail is preserved (records are never deleted)
+    """
+
+    def test_replace_schedule_archives_old_pending_items_and_preserves_audit_trail(self):
+        """When replace=True is executed, pending ai_processed_updates are archived as historical."""
+        from app.importer import import_to_db, ParsedRow
+        import datetime
+
+        db = MagicMock()
+        old_task_id = "00000000-0000-0000-0000-000000000101"
+        old_ai_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+        old_current_ai = [
+            types.SimpleNamespace(
+                id=old_ai_id,
+                matched_task_id=old_task_id,
+                model_response=json.dumps({"review_status": "pending", "activity": "Old Activity"}),
+            )
+        ]
+
+        def db_execute(stmt, params=None):
+            sql_str = str(stmt)
+            res = MagicMock()
+            if "FROM ai_processed_updates" in sql_str and "is_current = true" in sql_str:
+                res.fetchall.return_value = old_current_ai
+            return res
+
+        db.execute.side_effect = db_execute
+
+        new_rows = [
+            ParsedRow("P101", "Land Clearing", "Test Site", datetime.date(2026, 9, 1), datetime.date(2026, 9, 5), []),
+            ParsedRow("P102", "Excavation Work", "Test Site", datetime.date(2026, 9, 6), datetime.date(2026, 9, 12), ["P101"]),
+        ]
+
+        result = import_to_db(db, new_rows, "new_project.csv", replace=True)
+        self.assertEqual(result.tasks_imported, 2)
+
+        # Check that ai_processed_updates was updated to historical
+        executed_calls = db.execute.call_args_list
+        archived_updates = []
+        for call_args in executed_calls:
+            sql_text = str(call_args[0][0])
+            if "UPDATE ai_processed_updates" in sql_text and "model_response = :model_response" in sql_text:
+                params = call_args[0][1] if len(call_args[0]) > 1 else call_args[1]
+                archived_updates.append(params)
+
+        self.assertEqual(len(archived_updates), 1)
+        updated_params = archived_updates[0]
+        self.assertEqual(updated_params["id"], old_ai_id)
+        saved_resp = json.loads(updated_params["model_response"])
+        self.assertEqual(saved_resp["review_status"], "historical")
+        self.assertEqual(saved_resp["archived_reason"], "Schedule baseline was replaced")
+        self.assertEqual(saved_resp["historical_matched_task_id"], old_task_id)
+
+    def test_queue_filters_out_historical_items_from_active_pending_view(self):
+        """Active pending queue excludes historical items from prior schedules."""
+        db = MagicMock()
+
+        # Item 1: Old project update (archived as historical)
+        r1 = _row(
+            processed_id="rev-old-historical",
+            site_update_id="site-old",
+            source_update_id="UPD-OLD",
+            reported_on="2026-09-01",
+            location="Old Site",
+            raw_update="Old site activity report",
+            source_reference="Field Notes",
+            matched_task_id=None,
+            progress_percent=50.0,
+            status="in_progress",
+            delay_days=None,
+            delay_reason=None,
+            actual_start_date=None,
+            actual_end_date=None,
+            confidence_score=40.0,
+            model_name="mock-keyword-v1",
+            model_response=json.dumps({
+                "review_status": "historical",
+                "archived_reason": "Schedule baseline was replaced",
+            }),
+            processed_at="2026-09-01T10:00:00",
+            matched_st_id=None,
+            matched_source_task_id=None,
+            matched_activity=None,
+            matched_location=None,
+            matched_planned_start=None,
+            matched_planned_end=None,
+        )
+
+        # Item 2: New project update (currently pending review)
+        r2 = _row(
+            processed_id="rev-new-pending",
+            site_update_id="site-new",
+            source_update_id="UPD-NEW",
+            reported_on="2026-09-08",
+            location="Test Site",
+            raw_update="Manifold skid welding and tie-in underway",
+            source_reference="Field Notes",
+            matched_task_id=None,
+            progress_percent=20.0,
+            status="in_progress",
+            delay_days=None,
+            delay_reason=None,
+            actual_start_date=None,
+            actual_end_date=None,
+            confidence_score=45.0,
+            model_name="mock-keyword-v1",
+            model_response=json.dumps({"review_status": "pending"}),
+            processed_at="2026-09-08T10:00:00",
+            matched_st_id=None,
+            matched_source_task_id=None,
+            matched_activity=None,
+            matched_location=None,
+            matched_planned_start=None,
+            matched_planned_end=None,
+        )
+
+        db.execute.return_value.fetchall.side_effect = [
+            [r1, r2],  # _REVIEW_QUEUE_QUERY
+            [],        # _ALL_SCHEDULE_TASKS_QUERY
+        ]
+
+        # 1. Default pending queue: includes ONLY the new pending item
+        pending_items = get_review_queue(db, status="pending")
+        self.assertEqual(len(pending_items), 1)
+        self.assertEqual(pending_items[0]["review_id"], "rev-new-pending")
+
+        # 2. Historical query: includes ONLY the historical item
+        db.execute.return_value.fetchall.side_effect = [
+            [r1, r2],
+            [],
+        ]
+        historical_items = get_review_queue(db, status="historical")
+        self.assertEqual(len(historical_items), 1)
+        self.assertEqual(historical_items[0]["review_id"], "rev-old-historical")
+
+        # 3. All query: includes BOTH items for full auditability
+        db.execute.return_value.fetchall.side_effect = [
+            [r1, r2],
+            [],
+        ]
+        all_items = get_review_queue(db, status="all")
+        self.assertEqual(len(all_items), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
+

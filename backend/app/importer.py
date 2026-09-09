@@ -8,6 +8,7 @@ from __future__ import annotations
 import csv
 import datetime
 import io
+import json
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -238,6 +239,53 @@ def import_to_db(
 
     if replace:
         db.execute(text("DELETE FROM task_dependencies"))
+        # Archive pending review items and preserve historical audit trail
+        current_ai_rows = db.execute(
+            text(
+                """
+                SELECT id, matched_task_id, model_response
+                FROM ai_processed_updates
+                WHERE is_current = true
+                """
+            )
+        ).fetchall()
+
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        for ai_row in current_ai_rows:
+            row_id = str(ai_row.id)
+            raw_resp = ai_row.model_response
+            model_resp: dict[str, Any] = {}
+            if isinstance(raw_resp, dict):
+                model_resp = dict(raw_resp)
+            elif isinstance(raw_resp, str):
+                try:
+                    parsed = json.loads(raw_resp)
+                    if isinstance(parsed, dict):
+                        model_resp = parsed
+                except (ValueError, TypeError):
+                    pass
+
+            old_status = model_resp.get("review_status")
+            if old_status in (None, "pending"):
+                model_resp["review_status"] = "historical"
+            model_resp["archived_reason"] = "Schedule baseline was replaced"
+            model_resp["archived_at"] = now_iso
+            if ai_row.matched_task_id:
+                model_resp["historical_matched_task_id"] = str(ai_row.matched_task_id)
+
+            db.execute(
+                text(
+                    """
+                    UPDATE ai_processed_updates
+                    SET matched_task_id = NULL,
+                        model_response = :model_response
+                    WHERE id = :id
+                    """
+                ),
+                {"id": row_id, "model_response": json.dumps(model_resp)},
+            )
+
+        # Nullify any remaining non-current references before clearing tasks
         db.execute(
             text(
                 "UPDATE ai_processed_updates SET matched_task_id = NULL WHERE matched_task_id IS NOT NULL"

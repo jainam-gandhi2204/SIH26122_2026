@@ -375,7 +375,9 @@ def get_review_queue(
         # Filter by review status
         if clean_status == "pending" and review_state != "pending":
             continue
-        elif clean_status == "resolved" and review_state == "pending":
+        elif clean_status == "resolved" and review_state in ("pending", "historical"):
+            continue
+        elif clean_status == "historical" and review_state != "historical":
             continue
 
         conf = float(r.confidence_score) if r.confidence_score is not None else 0.0

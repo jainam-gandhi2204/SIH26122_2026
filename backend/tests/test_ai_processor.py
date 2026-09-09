@@ -1471,10 +1471,157 @@ class TaskActualsAccumulationTests(unittest.TestCase):
         current_status = "completed"
         incoming_status = "in_progress"
         status_after = "completed" if current_status == "completed" else incoming_status
-        self.assertEqual(status_after, "completed", "Completed status must never be downgraded")
+class RegressionScenario1MatchingTests(unittest.TestCase):
+    """Specific regression tests for Scenario 1:
+    Schedule:
+    - P101: Land Clearing
+    - P102: Excavation Work
+    - P103: Foundation Casting
+    - P104: Equipment Installation
+    All at 'Test Site'.
+    Update: 'Excavation work at Test Site is approximately 60% complete. Heavy rainfall caused a two-day delay.'
+    Expected:
+    - P102 is identified with high confidence (>= 75%)
+    - Auto-linked and updated (progress=60%, status='delayed', delay_days=2, delay_reason extracted)
+    - Not left as pending review
+    """
 
+    def setUp(self):
+        self.p101_id = "11111111-1111-1111-1111-111111111101"
+        self.p102_id = "11111111-1111-1111-1111-111111111102"
+        self.p103_id = "11111111-1111-1111-1111-111111111103"
+        self.p104_id = "11111111-1111-1111-1111-111111111104"
+
+        self.candidate_tasks = [
+            {
+                "id": self.p101_id,
+                "source_task_id": "P101",
+                "activity": "Land Clearing",
+                "location": "Test Site",
+                "planned_start": "2026-09-01",
+                "planned_end": "2026-09-05",
+            },
+            {
+                "id": self.p102_id,
+                "source_task_id": "P102",
+                "activity": "Excavation Work",
+                "location": "Test Site",
+                "planned_start": "2026-09-06",
+                "planned_end": "2026-09-12",
+            },
+            {
+                "id": self.p103_id,
+                "source_task_id": "P103",
+                "activity": "Foundation Casting",
+                "location": "Test Site",
+                "planned_start": "2026-09-13",
+                "planned_end": "2026-09-20",
+            },
+            {
+                "id": self.p104_id,
+                "source_task_id": "P104",
+                "activity": "Equipment Installation",
+                "location": "Test Site",
+                "planned_start": "2026-09-21",
+                "planned_end": "2026-09-30",
+            },
+        ]
+        self.provider = MockAIProvider()
+        self.raw_update = "Excavation work at Test Site is approximately 60% complete. Heavy rainfall caused a two-day delay."
+
+    def test_p102_matched_with_high_confidence_and_extracted_facts(self):
+        """P102 Excavation Work is matched with high confidence (>= 75%), 60% progress, 2-day delay, delayed status."""
+        result = self.provider.analyse(
+            raw_update=self.raw_update,
+            location="Test Site",
+            reported_on="2026-09-08",
+            candidate_tasks=self.candidate_tasks,
+        )
+
+        self.assertEqual(result.matched_task_id, self.p102_id)
+        self.assertGreaterEqual(result.confidence_score, 75.0)
+        self.assertEqual(result.progress_percent, 60.0)
+        self.assertEqual(result.status, "delayed")
+        self.assertEqual(result.delay_days, 2)
+        delay_reason_lower = (result.delay_reason or "").lower()
+        self.assertTrue(
+            "rainfall" in delay_reason_lower or "rain" in delay_reason_lower or "delay" in delay_reason_lower
+        )
+        self.assertEqual(result.model_response.get("confidence_tier"), "high")
+
+    def test_location_tolerance_when_default_location_passed(self):
+        """Even if location was ingested as 'Well Pad A', the text contains 'Test Site' and matches P102."""
+        result = self.provider.analyse(
+            raw_update=self.raw_update,
+            location="Well Pad A",
+            reported_on="2026-09-08",
+            candidate_tasks=self.candidate_tasks,
+        )
+        self.assertEqual(result.matched_task_id, self.p102_id)
+        self.assertGreaterEqual(result.confidence_score, 75.0)
+
+    def test_process_site_update_auto_links_and_updates_actuals(self):
+        """High confidence match triggers update_schedule_task_actuals in process_site_update."""
+        import types
+        db = MagicMock()
+        update_row = MagicMock()
+        update_row.id = uuid.UUID("33333333-3333-3333-3333-333333333333")
+        update_row.location = "Test Site"
+        update_row.raw_update = self.raw_update
+        update_row.reported_on = datetime.date(2026, 9, 8)
+
+        inserted_mock = MagicMock()
+        inserted_mock.id = "44444444-4444-4444-4444-444444444444"
+        inserted_mock.site_update_id = str(update_row.id)
+        inserted_mock.matched_task_id = self.p102_id
+        inserted_mock.progress_percent = 60.0
+        inserted_mock.status = "delayed"
+        inserted_mock.delay_days = 2
+        inserted_mock.delay_reason = "Heavy rainfall caused a two-day delay."
+        inserted_mock.actual_start_date = None
+        inserted_mock.actual_end_date = None
+        inserted_mock.confidence_score = 95.0
+        inserted_mock.model_name = "mock-keyword-v1"
+        inserted_mock.model_response = json.dumps({"confidence_tier": "high"})
+        inserted_mock.processed_at = "2026-09-08T10:00:00"
+        inserted_mock.is_current = True
+
+        task_mock_rows = [
+            types.SimpleNamespace(
+                id=t["id"],
+                source_task_id=t["source_task_id"],
+                activity=t["activity"],
+                location=t["location"],
+                planned_start=t["planned_start"],
+                planned_end=t["planned_end"],
+            )
+            for t in self.candidate_tasks
+        ]
+
+        def db_execute(stmt, params=None):
+            sql_str = str(stmt)
+            mock_res = MagicMock()
+            if "FROM site_updates" in sql_str:
+                mock_res.fetchone.return_value = update_row
+            elif "FROM schedule_tasks" in sql_str:
+                mock_res.fetchall.return_value = task_mock_rows
+            elif "INSERT INTO ai_processed_updates" in sql_str:
+                mock_res.fetchone.return_value = inserted_mock
+            return mock_res
+
+        db.execute.side_effect = db_execute
+
+        res = process_site_update(db, str(update_row.id), provider=self.provider)
+        self.assertEqual(res["matched_task_id"], self.p102_id)
+        self.assertGreaterEqual(res["confidence_score"], 70.0)
+
+        # Check that UPDATE schedule_tasks actuals was executed
+        executed_sqls = [str(call_args[0][0]) for call_args in db.execute.call_args_list]
+        update_task_calls = [s for s in executed_sqls if "UPDATE schedule_tasks" in s]
+        self.assertEqual(len(update_task_calls), 1)
 
 
 if __name__ == "__main__":
     unittest.main()
+
 

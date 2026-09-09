@@ -1,4 +1,4 @@
-﻿"""Tests for app/spreadsheet_ingestor.py.
+"""Tests for app/spreadsheet_ingestor.py.
 
 All tests are pure unit tests — no database, no network.
 CSV bytes are built in-memory; XLSX bytes are built with openpyxl.

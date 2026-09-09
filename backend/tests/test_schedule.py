@@ -1,4 +1,4 @@
-﻿"""Tests for the /schedule/tasks endpoint."""
+"""Tests for the /schedule/tasks endpoint."""
 
 import datetime
 import unittest

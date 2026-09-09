@@ -221,12 +221,244 @@ def _extract_end_date(text: str) -> str | None:
     return None
 
 
-class MockAIProvider(AIProvider):
-    """Deterministic keyword-based analyser used when no real API is configured.
+# ---------------------------------------------------------------------------
+# Number words & delay extraction helpers
+# ---------------------------------------------------------------------------
 
-    Confidence is intentionally low (40) because this is a heuristic, not a model.
-    Values are populated only when they can be directly read from the text (FACT)
-    or safely inferred from the schedule context (INFERENCE).
+_WORD_TO_NUM: dict[str, int] = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "twenty": 20, "thirty": 30,
+}
+
+
+def _extract_delay_days(text: str) -> int | None:
+    """Extract delay magnitude in days from text.
+
+    Supports digits ('3 days delay', '2-day delay') and word numbers
+    ('two-day delay', 'three days behind').
+    """
+    # 1. Matches: "2-day delay", "two-day delay", "three days behind", "1 day delay"
+    pattern1 = re.search(
+        r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|fourteen)[-\s]+day[s]?(?:\s+(?:delay|behind|late|overdue|slip))?\b",
+        text,
+        re.I,
+    )
+    if pattern1:
+        raw_val = pattern1.group(1).lower()
+        if raw_val.isdigit():
+            return int(raw_val)
+        if raw_val in _WORD_TO_NUM:
+            return _WORD_TO_NUM[raw_val]
+
+    # 2. Matches: "delayed by 2 days", "delayed by two days", "slip of 3 days"
+    pattern2 = re.search(
+        r"\b(?:delay(?:ed)?\s*(?:by|of)?|behind\s*(?:by)?|late\s*(?:by)?|slip\s*(?:of)?)\s*(\d+|one|two|three|four|five|six|seven|eight|nine|ten|fourteen)\s*day[s]?\b",
+        text,
+        re.I,
+    )
+    if pattern2:
+        raw_val = pattern2.group(1).lower()
+        if raw_val.isdigit():
+            return int(raw_val)
+        if raw_val in _WORD_TO_NUM:
+            return _WORD_TO_NUM[raw_val]
+
+    # 3. Matches: "delayed by 2"
+    pattern3 = re.search(r"\bdelayed\s+by\s+(\d+)\b", text, re.I)
+    if pattern3:
+        return int(pattern3.group(1))
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Activity matching, normalization, and confidence scoring
+# ---------------------------------------------------------------------------
+
+_STOP_WORDS = frozenset({
+    "the", "at", "is", "of", "and", "in", "to", "for", "with", "a", "an",
+    "on", "by", "from", "as", "about", "around", "approximately", "roughly",
+    "complete", "completed", "progress", "due", "site", "pad", "work"
+})
+
+_ACTIVITY_SYNONYMS: dict[str, list[str]] = {
+    "excavat": ["excavation", "excavating", "excavated", "excavate", "earthwork", "digging", "trenched", "trenching"],
+    "clear": ["clearing", "clearance", "cleared", "site prep", "site preparation", "grubbing", "grading"],
+    "cast": ["casting", "cast", "concreting", "concrete", "pour", "pouring", "poured"],
+    "foundat": ["foundation", "foundations", "substructure", "footing", "footings"],
+    "install": ["installation", "install", "installed", "installing", "erection", "erecting", "mount", "mounting"],
+    "equip": ["equipment", "machinery", "skid", "generator", "pump", "compressor", "vessel"],
+    "pipe": ["piping", "pipeline", "pipe", "pipe laying", "pipework", "flowline"],
+    "weld": ["welding", "weld", "welded", "tie-in", "joint", "jointing"],
+    "commiss": ["commissioning", "commission", "commissioned", "pre-commissioning", "handover"],
+    "test": ["testing", "test", "tested", "hydrotest", "hydrotesting", "pressure test"],
+}
+
+
+def score_candidate_task(
+    task: dict[str, Any],
+    raw_update: str,
+    location: str,
+) -> float:
+    """Calculate match score (0.0 to 100.0) between a task and site update."""
+    raw_lower = raw_update.lower()
+    task_act = str(task.get("activity", "")).strip().lower()
+    task_loc = str(task.get("location", "")).strip().lower()
+    loc_lower = location.strip().lower()
+
+    # Extract distinctive activity tokens
+    act_words = [w for w in re.findall(r"\w+", task_act) if len(w) > 2]
+    distinctive = [w for w in act_words if w not in _STOP_WORDS]
+    if not distinctive:
+        distinctive = act_words
+
+    if not distinctive:
+        return 0.0
+
+    # Check exact phrase or cleaned phrase
+    clean_phrase = " ".join(distinctive)
+    if task_act in raw_lower or clean_phrase in raw_lower:
+        base_score = 95.0
+    else:
+        matched_tokens = 0
+        for tok in distinctive:
+            # direct token in update
+            if re.search(r"\b" + re.escape(tok) + r"\b", raw_lower):
+                matched_tokens += 1
+                continue
+            # stem/synonym in update
+            found_stem = False
+            for root, syns in _ACTIVITY_SYNONYMS.items():
+                if tok.startswith(root) or any(s in tok for s in syns):
+                    if any(re.search(r"\b" + re.escape(s) + r"\b", raw_lower) or s in raw_lower for s in syns):
+                        matched_tokens += 1
+                        found_stem = True
+                        break
+            if found_stem:
+                continue
+
+        if matched_tokens == len(distinctive):
+            base_score = 90.0
+        elif matched_tokens > 0:
+            ratio = matched_tokens / len(distinctive)
+            base_score = 50.0 + (ratio * 35.0)
+        else:
+            base_score = 0.0
+
+    if base_score == 0.0:
+        return 0.0
+
+    # Location agreement bonus (+5)
+    location_bonus = 0.0
+    if task_loc and (task_loc == loc_lower or task_loc in raw_lower or loc_lower in task_loc):
+        location_bonus = 5.0
+
+    return min(100.0, base_score + location_bonus)
+
+
+def evaluate_task_matches(
+    candidate_tasks: list[dict[str, Any]],
+    raw_update: str,
+    location: str,
+) -> tuple[str | None, float, dict[str, Any]]:
+    """Match update to candidate tasks and return (matched_task_id, confidence_score, metadata).
+
+    Tiers:
+    - High confidence (>= 75.0): single clear candidate, auto-link.
+    - Medium confidence (50.0 - 74.9): ambiguous match or tentative keyword overlap, requires planner review.
+    - Low confidence (< 50.0): no candidate matches, requires unmatched planner review.
+    """
+    if not candidate_tasks:
+        return (
+            None,
+            20.0,
+            {
+                "confidence_tier": "low",
+                "matched_source_task_id": None,
+                "is_ambiguous": False,
+                "reasoning": "No candidate tasks available to match.",
+            },
+        )
+
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for t in candidate_tasks:
+        score = score_candidate_task(t, raw_update, location)
+        scored.append((score, t))
+
+    # Sort descending by score, then planned_start
+    scored.sort(key=lambda x: (-x[0], x[1].get("planned_start") or ""))
+    top_score, top_task = scored[0]
+
+    if top_score >= 75.0:
+        # Check ambiguity against second candidate
+        if len(scored) > 1:
+            second_score, second_task = scored[1]
+            if second_score >= 50.0 and (top_score - second_score < 20.0):
+                # Competing candidates -> Medium tier (ambiguous match for planner review)
+                return (
+                    top_task["id"],
+                    60.0,
+                    {
+                        "confidence_tier": "medium",
+                        "matched_source_task_id": top_task.get("source_task_id"),
+                        "is_ambiguous": True,
+                        "ambiguity_competing_task_id": second_task.get("source_task_id"),
+                        "reasoning": f"Ambiguous match between {top_task.get('source_task_id')} and {second_task.get('source_task_id')} (close keyword scores). Requires planner review.",
+                    },
+                )
+        # Unambiguous high confidence match
+        return (
+            top_task["id"],
+            top_score,
+            {
+                "confidence_tier": "high",
+                "matched_source_task_id": top_task.get("source_task_id"),
+                "is_ambiguous": False,
+                "reasoning": f"High-confidence match to {top_task.get('source_task_id')} ({top_task.get('activity')}) with {top_score:.1f}% confidence score.",
+            },
+        )
+
+    if top_score >= 50.0:
+        # Medium confidence match -> Planner review
+        return (
+            top_task["id"],
+            top_score,
+            {
+                "confidence_tier": "medium",
+                "matched_source_task_id": top_task.get("source_task_id"),
+                "is_ambiguous": False,
+                "reasoning": f"Medium-confidence tentative match to {top_task.get('source_task_id')} ({top_task.get('activity')}). Planner review recommended.",
+            },
+        )
+
+    # Low confidence fallback (candidate exists by date, but keyword score is low or absent)
+    date_sorted = sorted(
+        candidate_tasks,
+        key=lambda t: (t.get("planned_end") or "", t.get("planned_start") or ""),
+    )
+    fallback_task = date_sorted[0]
+    return (
+        fallback_task["id"],
+        40.0,
+        {
+            "confidence_tier": "low",
+            "matched_source_task_id": fallback_task.get("source_task_id"),
+            "suggested_source_task_id": fallback_task.get("source_task_id"),
+            "is_ambiguous": False,
+            "reasoning": f"Tentative date-based fallback to {fallback_task.get('source_task_id')} ({fallback_task.get('activity')}) with low confidence (40%). Requires planner review.",
+        },
+    )
+
+
+class MockAIProvider(AIProvider):
+    """Deterministic keyword and activity-similarity analyser used when no real API is configured.
+
+    Implements calibrated confidence tiers:
+    - High confidence (>= 75.0): auto-link
+    - Medium confidence (50.0 - 74.9): planner review with suggested match / ambiguity flag
+    - Low confidence (< 50.0): unmatched planner review
     """
 
     def analyse(
@@ -238,22 +470,12 @@ class MockAIProvider(AIProvider):
     ) -> AnalysisResult:
         text_lower = raw_update.lower()
 
-        # --- Task matching (INFERENCE: same location, earliest planned_end first) ---
-        matched_task_id: str | None = None
-        if candidate_tasks:
-            sorted_tasks = sorted(
-                candidate_tasks,
-                key=lambda t: (t.get("planned_end") or "", t.get("planned_start") or ""),
-            )
-            # Prefer task whose activity keywords appear in the update text
-            for task in sorted_tasks:
-                activity_words = task.get("activity", "").lower().split()
-                if any(w in text_lower for w in activity_words if len(w) > 3):
-                    matched_task_id = task["id"]
-                    break
-            # Fall back to first task by date
-            if matched_task_id is None:
-                matched_task_id = sorted_tasks[0]["id"]
+        # --- Task matching with confidence tiers ---
+        matched_task_id, confidence, match_meta = evaluate_task_matches(
+            candidate_tasks=candidate_tasks,
+            raw_update=raw_update,
+            location=location,
+        )
 
         # --- Status (INFERENCE from keywords) ---
         status: str | None = None
@@ -273,23 +495,27 @@ class MockAIProvider(AIProvider):
         if progress_percent is None and status == "completed":
             progress_percent = 100.0
 
-        # --- Delay (FACT: only from explicit "X day(s)" near "delay/behind") ---
-        delay_days: int | None = None
+        # --- Delay (FACT: digits or word numbers near delay keywords) ---
+        delay_days = _extract_delay_days(raw_update)
         delay_reason: str | None = None
-        delay_match = re.search(
-            r"(\d+)\s*day[s]?\s*(?:delay|behind|late|overdue)", raw_update, re.I
-        )
-        if delay_match:
-            delay_days = int(delay_match.group(1))
-        if status == "delayed" and delay_days is None:
-            # delay acknowledged but magnitude not stated
-            delay_days = None
+
+        # A task reporting < 100% progress cannot be 'completed'
+        if progress_percent is not None and progress_percent < 100.0 and status == "completed":
+            status = "in_progress"
+
+        if delay_days is not None and delay_days > 0:
+            if progress_percent is None or progress_percent < 100.0:
+                status = "delayed"
+        elif "delay" in text_lower or "behind" in text_lower:
+            if progress_percent is None or progress_percent < 100.0:
+                status = "delayed"
+
         # Extract reason (INFERENCE: sentence containing delay keyword)
         if status in ("delayed", "blocked"):
             sentences = re.split(r"[.!?\n]", raw_update)
             for sentence in sentences:
                 sl = sentence.lower()
-                if any(k in sl for k in ("delay", "behind", "block", "halt", "stopp")):
+                if any(k in sl for k in ("delay", "behind", "block", "halt", "stopp", "rainfall", "rain", "weather", "breakdown")):
                     reason = sentence.strip()
                     if reason:
                         delay_reason = reason
@@ -303,23 +529,26 @@ class MockAIProvider(AIProvider):
         model_response: dict[str, Any] = {
             "provider": _MOCK_MODEL_NAME,
             "text_analysed": raw_update[:500],
+            "matched_source_task_id": match_meta.get("matched_source_task_id"),
+            "confidence_tier": match_meta.get("confidence_tier"),
+            "is_ambiguous": match_meta.get("is_ambiguous", False),
+            "reasoning": match_meta.get("reasoning", ""),
             "matched_keywords": {
                 "status_keyword": next(
                     (k for k in _STATUS_KEYWORDS if k in text_lower), None
                 ),
                 "percent_pattern_found": pct_match is not None,
+                "delay_found": delay_days is not None,
                 "start_date_found": actual_start_date is not None,
                 "end_date_found": actual_end_date is not None,
             },
             "note": (
-                "Deterministic keyword heuristic. "
+                "Deterministic matching and confidence tiering. "
                 "Values marked UNKNOWN are None. "
                 "Replace with a real AI provider by setting AI_PROVIDER=gemini "
                 "and GEMINI_API_KEY in .env."
             ),
         }
-
-        confidence: float = 40.0 if matched_task_id else 20.0
 
         return AnalysisResult(
             matched_task_id=matched_task_id,
@@ -547,14 +776,27 @@ class GeminiAIProvider(AIProvider):
         if progress is not None and not (0.0 <= progress <= 100.0):
             progress = None
 
-        # delay_days: must be non-negative int
+        # delay_days: must be non-negative int, fallback to text parsing if model missed it
         delay_days = _safe_int(parsed.get("delay_days"))
-        if delay_days is not None and delay_days < 0:
+        if delay_days is None:
+            delay_days = _extract_delay_days(raw_update)
+        elif delay_days < 0:
             delay_days = None
 
+        if delay_days and delay_days > 0 and status is None:
+            status = "delayed"
+
         # confidence_score: must be 0-100
-        confidence = _safe_float(parsed.get("confidence_score")) or 0.0
-        confidence = max(0.0, min(100.0, confidence))
+        raw_conf = _safe_float(parsed.get("confidence_score"))
+        if raw_conf is not None:
+            confidence = max(0.0, min(100.0, raw_conf))
+        else:
+            _, eval_conf, _ = evaluate_task_matches(
+                candidate_tasks=candidate_tasks,
+                raw_update=raw_update,
+                location=location,
+            )
+            confidence = eval_conf
 
         # date fields: must match YYYY-MM-DD
         actual_start = _safe_iso_date(parsed.get("actual_start_date"))

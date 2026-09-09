@@ -13,7 +13,8 @@ export default function IngestModal({
 }) {
   const [tab, setTab] = useState(initialTab);
   const [text, setText] = useState('');
-  const [reportedDate, setReportedDate] = useState('2026-09-09');
+  const [location, setLocation] = useState('');
+  const [reportedDate, setReportedDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [selectedFile, setSelectedFile] = useState(null);
   const [uploadMode, setUploadMode] = useState(initialUploadMode); // 'updates' or 'schedule'
   const [replaceSchedule, setReplaceSchedule] = useState(false);
@@ -29,6 +30,7 @@ export default function IngestModal({
     setConfirmReplace(false);
     setSelectedFile(null);
     setFeedback(null);
+    setLocation('');
   }, [initialTab, initialUploadMode, isOpen]);
 
   if (!isOpen) return null;
@@ -48,6 +50,7 @@ export default function IngestModal({
       const res = await ingestSiteUpdate({
         text: text.trim(),
         reported_date: reportedDate || undefined,
+        location: location.trim() || undefined,
       });
 
       setFeedback({
@@ -56,6 +59,7 @@ export default function IngestModal({
         details: res,
       });
       setText('');
+      setLocation('');
       onSuccess?.();
     } catch (err) {
       setFeedback({
@@ -272,16 +276,30 @@ export default function IngestModal({
           {tab === 'text' ? (
             /* Free Text Ingestion Form */
             <form onSubmit={handleTextSubmit} className="space-y-4">
-              <div>
-                <label className="block text-[12px] font-bold text-slate-700 mb-1">
-                  Reported Date
-                </label>
-                <input
-                  type="date"
-                  value={reportedDate}
-                  onChange={(e) => setReportedDate(e.target.value)}
-                  className="w-full bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-[12.5px] text-slate-800 focus:outline-none focus:ring-2 focus:ring-teal-500/20 focus:border-teal-600"
-                />
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-[12px] font-bold text-slate-700 mb-1">
+                    Reported Date
+                  </label>
+                  <input
+                    type="date"
+                    value={reportedDate}
+                    onChange={(e) => setReportedDate(e.target.value)}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-[12.5px] text-slate-800 focus:outline-none focus:ring-2 focus:ring-teal-500/20 focus:border-teal-600"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[12px] font-bold text-slate-700 mb-1">
+                    Location / Work Site <span className="font-normal text-slate-400">(Optional)</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={location}
+                    onChange={(e) => setLocation(e.target.value)}
+                    placeholder="e.g. Test Site, Well Pad A"
+                    className="w-full bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-[12.5px] text-slate-800 focus:outline-none focus:ring-2 focus:ring-teal-500/20 focus:border-teal-600"
+                  />
+                </div>
               </div>
 
               <div>
