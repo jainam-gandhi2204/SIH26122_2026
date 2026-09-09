@@ -127,7 +127,7 @@ _SINGLE_TASK_QUERY = text(
           AND matched_task_id IS NOT NULL
         ORDER BY matched_task_id, processed_at DESC
     ) ap ON ap.matched_task_id = st.id
-    WHERE st.id = :task_id
+    WHERE (CAST(st.id AS TEXT) = :task_id OR st.source_task_id = :task_id)
     """
 )
 
@@ -481,6 +481,7 @@ def get_task_impact(db: Session, task_id: str) -> dict[str, Any] | None:
         return None
 
     root = _fmt_task(root_row)
+    root_uuid = str(root_row.task_id)
 
     # Determine whether the root task should flag downstream tasks as at-risk.
     # A task is "concerning" if it is delayed, blocked, or incomplete (<100%)
@@ -505,8 +506,8 @@ def get_task_impact(db: Session, task_id: str) -> dict[str, Any] | None:
 
     # BFS from the root task to collect all downstream tasks
     downstream: list[dict[str, Any]] = []
-    visited: set[str] = {task_id}
-    queue: deque[str] = deque(downstream_adj.get(task_id, []))
+    visited: set[str] = {root_uuid}
+    queue: deque[str] = deque(downstream_adj.get(root_uuid, []))
     while queue:
         tid = queue.popleft()
         if tid in visited:

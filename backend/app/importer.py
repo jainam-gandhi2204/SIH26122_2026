@@ -191,6 +191,7 @@ def import_to_db(
     db: Session,
     rows: list[ParsedRow],
     filename: str,
+    replace: bool = False,
 ) -> ImportResult:
     """Insert or update schedule_imports + schedule_tasks + task_dependencies.
 
@@ -198,18 +199,23 @@ def import_to_db(
     --------------------
     1. A new schedule_imports record is inserted to preserve the audit trail
        of each import attempt.
-    2. For each incoming row:
-       - If a task with that source_task_id already exists in schedule_tasks,
-         it is UPDATED in place. Its existing primary key (UUID) is preserved,
-         ensuring that foreign-key relationships (such as
-         ai_processed_updates.matched_task_id) remain intact.
-       - If it does not exist, a new schedule_tasks row is INSERTED with a
-         fresh UUID.
-       - If duplicate rows exist for the same source_task_id (e.g. from prior
-         buggy imports), the canonical task (prioritizing tasks already
-         referenced by ai_processed_updates) is preserved and redundant
-         duplicates are removed.
-    3. Existing task_dependencies for the imported tasks are refreshed so
+    2. If replace is True:
+       - Clears existing task_dependencies and schedule_tasks (and detaches
+         existing matched_task_id in ai_processed_updates) to establish a clean
+         new project schedule baseline.
+    3. If replace is False (default):
+       - For each incoming row:
+         - If a task with that source_task_id already exists in schedule_tasks,
+           it is UPDATED in place. Its existing primary key (UUID) is preserved,
+           ensuring that foreign-key relationships (such as
+           ai_processed_updates.matched_task_id) remain intact.
+         - If it does not exist, a new schedule_tasks row is INSERTED with a
+           fresh UUID.
+         - If duplicate rows exist for the same source_task_id (e.g. from prior
+           buggy imports), the canonical task (prioritizing tasks already
+           referenced by ai_processed_updates) is preserved and redundant
+           duplicates are removed.
+    4. Existing task_dependencies for the imported tasks are refreshed so
        that re-importing the same CSV does not duplicate dependency edges,
        while fully supporting single and multiple dependencies (e.g. T107 ->
        T104 and T106).
@@ -229,6 +235,15 @@ def import_to_db(
         ),
         {"id": import_id, "filename": filename, "row_count": len(rows)},
     )
+
+    if replace:
+        db.execute(text("DELETE FROM task_dependencies"))
+        db.execute(
+            text(
+                "UPDATE ai_processed_updates SET matched_task_id = NULL WHERE matched_task_id IS NOT NULL"
+            )
+        )
+        db.execute(text("DELETE FROM schedule_tasks"))
 
     if not rows:
         db.commit()

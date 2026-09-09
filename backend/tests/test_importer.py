@@ -547,6 +547,24 @@ class IdempotencyTests(unittest.TestCase):
         self.assertEqual(len(sql_calls), 1)
         self.assertIn("schedule_imports", sql_calls[0])
 
+    def test_import_to_db_replace_clears_old_schedule_and_imports_new(self):
+        """When replace=True, task_dependencies and schedule_tasks are cleared before inserting."""
+        db = self._mock_db()
+        rows = [
+            ParsedRow("P101", "Survey", "Site 1",
+                      datetime.date(2026, 10, 1), datetime.date(2026, 10, 5), dependencies=[]),
+            ParsedRow("P102", "Excavation", "Site 1",
+                      datetime.date(2026, 10, 6), datetime.date(2026, 10, 10), dependencies=["P101"]),
+        ]
+        result = import_to_db(db, rows, "new_project_schedule.csv", replace=True)
+        self.assertEqual(result.tasks_imported, 2)
+        self.assertEqual(result.dependencies_imported, 1)
+
+        sql_calls = self._sql_texts(db)
+        self.assertTrue(any("DELETE FROM task_dependencies" in s for s in sql_calls))
+        self.assertTrue(any("DELETE FROM schedule_tasks" in s for s in sql_calls))
+        self.assertTrue(any("UPDATE ai_processed_updates SET matched_task_id = NULL" in s for s in sql_calls))
+
 
 if __name__ == "__main__":
     unittest.main()

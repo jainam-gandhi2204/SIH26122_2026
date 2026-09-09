@@ -20,7 +20,7 @@ import json
 import uuid
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, Float, Integer, String, text
 from sqlalchemy.orm import Session
 
 from app.ai_provider import AIProvider, AnalysisResult, get_provider
@@ -34,7 +34,8 @@ _FETCH_SITE_UPDATE = text(
     """
     SELECT id, source_update_id, reported_on, location, raw_update, ingested_at, source_reference
     FROM site_updates
-    WHERE source_update_id = :update_id
+    WHERE CAST(id AS TEXT) = :update_id OR source_update_id = :update_id
+    LIMIT 1
     """
 )
 
@@ -99,6 +100,14 @@ _UPDATE_TASK_ACTUALS = text(
         updated_at = now()
     WHERE id = :task_id
     """
+).bindparams(
+    bindparam("progress_percent", type_=Float),
+    bindparam("status", type_=String),
+    bindparam("delay_days", type_=Integer),
+    bindparam("delay_reason", type_=String),
+    bindparam("actual_start_date", type_=String),
+    bindparam("actual_end_date", type_=String),
+    bindparam("reported_on", type_=String),
 )
 
 _INSERT_PROCESSED = text(
@@ -154,23 +163,24 @@ _INSERT_PROCESSED = text(
 _FETCH_CURRENT_RESULT = text(
     """
     SELECT
-        id,
-        site_update_id,
-        matched_task_id,
-        progress_percent,
-        status,
-        delay_days,
-        delay_reason,
-        actual_start_date,
-        actual_end_date,
-        confidence_score,
-        model_name,
-        model_response,
-        processed_at,
-        is_current
-    FROM ai_processed_updates
-    WHERE site_update_id = :site_update_id
-      AND is_current = true
+        ap.id,
+        ap.site_update_id,
+        ap.matched_task_id,
+        ap.progress_percent,
+        ap.status,
+        ap.delay_days,
+        ap.delay_reason,
+        ap.actual_start_date,
+        ap.actual_end_date,
+        ap.confidence_score,
+        ap.model_name,
+        ap.model_response,
+        ap.processed_at,
+        ap.is_current
+    FROM ai_processed_updates ap
+    JOIN site_updates su ON su.id = ap.site_update_id
+    WHERE (CAST(ap.site_update_id AS TEXT) = :site_update_id OR su.source_update_id = :site_update_id)
+      AND ap.is_current = true
     LIMIT 1
     """
 )

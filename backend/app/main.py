@@ -20,10 +20,21 @@ from app.review_queue import (
 )
 
 
+from fastapi.middleware.cors import CORSMiddleware
+
+
 app = FastAPI(
     title="SIH26122 API",
     version="0.1.0",
     description="Backend foundation for the SIH 2026 prototype.",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -87,6 +98,7 @@ def list_schedule_tasks(db: Session = Depends(get_db)) -> list[dict]:
 @app.post("/schedule/import", tags=["schedule"], status_code=status.HTTP_201_CREATED)
 async def import_schedule_csv(
     file: UploadFile,
+    replace: bool = Query(False, description="If true, replace existing schedule tasks and dependencies before importing"),
     db: Session = Depends(get_db),
 ) -> dict:
     """Accept a CSV file and import its tasks into the schedule tables.
@@ -114,7 +126,7 @@ async def import_schedule_csv(
         )
 
     try:
-        result = schedule_importer.import_to_db(db, parsed_rows, filename)
+        result = schedule_importer.import_to_db(db, parsed_rows, filename, replace=replace)
     except SQLAlchemyError as error:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
