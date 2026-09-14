@@ -1,0 +1,194 @@
+# Domain Vocabulary & Alias Configuration
+# =========================================
+# Purpose: Normalize informal/abbreviated site language to canonical activity
+# and location terms before AI matching. This file is loaded at runtime and can
+# be edited without any code changes.
+#
+# Format:
+#   Each key is the CANONICAL term (matches schedule activity or location name).
+#   Each value is a list of aliases: abbreviations, informal terms, common typos,
+#   or domain-specific shorthand that should map to that canonical term.
+#
+# Rules:
+#   - Matching is case-insensitive.
+#   - Longer aliases are matched before shorter ones (prevents partial mismatch).
+#   - Typos are listed explicitly (not computed); only add if confirmed common.
+#   - This is a shared project-level vocabulary. Project teams should add
+#     project-specific aliases here (e.g., specific site codes, local names).
+#
+# Do NOT add generic English words here — only domain/project-specific terms.
+
+# ---------------------------------------------------------------------------
+# Activity Aliases
+# ---------------------------------------------------------------------------
+# Maps informal/abbreviated activity names → canonical schedule activity terms.
+activity_aliases:
+  "Right of Way Clearance":
+    - "ROW"
+    - "row clearing"
+    - "row clearance"
+    - "row work"
+    - "corridor clearing"
+
+  "Non-Destructive Testing":
+    - "NDT"
+    - "non destructive test"
+    - "ndt testing"
+    - "nondestructive test"
+    - "weld inspection"
+    - "radiographic test"
+    - "radiography"
+
+  "Hydrostatic Pressure Test":
+    - "hydro test"
+    - "hydrostatic test"
+    - "hydrotest"
+    - "hydrotesting"
+    - "hydro testing"
+    - "water pressure test"
+
+  "Site Preparation":
+    - "site prep"
+    - "site clearing"
+    - "site clearance"
+    - "grubbing"
+    - "grading"
+    - "sitework"
+    - "site work"
+    - "site setup"
+    - "mobilisation"
+    - "mobilization"
+    - "site mob"
+
+  "Excavation Work":
+    - "excavating"
+    - "excavated"
+    - "digging"
+    - "earthwork"
+    - "earth work"
+    - "trenching"
+    - "trenched"
+    - "trench"
+    - "excvation"        # common typo
+    - "exvacation"       # common typo
+    - "bedding"          # trench bedding often follows excavation
+    - "soil removal"
+    - "cutting"
+
+  "Foundation Construction":
+    - "foundation work"
+    - "concreting"
+    - "concrete pour"
+    - "casting"
+    - "footing"
+    - "footings"
+    - "substructure"
+    - "raft foundation"
+
+  "Pipeline Laying":
+    - "pipe laying"
+    - "pipe lay"
+    - "pipeline installation"
+    - "pipeline laid"
+    - "pipe laid"
+    - "piping"
+    - "pipe stringing"
+    - "stringing"
+    - "pipe lowering"
+    - "flowline"
+    - "linepipe"
+    - "line pipe"
+
+  "Welding":
+    - "welded"
+    - "tie-in"
+    - "tiein"
+    - "tie in"
+    - "jointing"
+    - "butt weld"
+    - "girth weld"
+
+  "Commissioning":
+    - "commissioned"
+    - "pre-commissioning"
+    - "precommissioning"
+    - "handover"
+    - "startup"
+    - "start-up"
+    - "start up"
+    - "energization"
+    - "energisation"
+    - "signed off"
+    - "sign off"
+
+  "Equipment Installation":
+    - "equipment install"
+    - "equipment erection"
+    - "skid installation"
+    - "skid erection"
+    - "machinery installation"
+    - "pump installation"
+    - "compressor installation"
+    - "vessel installation"
+    - "equipment mounted"
+
+  "Land Clearing":
+    - "land clearance"
+    - "vegetation clearing"
+    - "bush clearing"
+    - "tree clearing"
+    - "jungle clearing"
+
+  "Control Panel Installation":
+    - "control panel install"
+    - "electrical panel"
+    - "switchgear"
+    - "instrumentation panel"
+
+# ---------------------------------------------------------------------------
+# Location Aliases
+# ---------------------------------------------------------------------------
+# Maps informal/abbreviated location names → canonical schedule location terms.
+# IMPORTANT: Do NOT include aliases that are substrings of the canonical name
+# (e.g., do not add "well pad a" as alias of "Well Pad A" — it causes
+# double-replacement). Only include genuinely different/informal terms.
+location_aliases:
+  "Well Pad A":
+    - "WPA"
+    - "WP-A"
+    - "WP_A"
+    - "wp a"
+    - "wellpad a"
+    - "well-pad-a"
+    - "wpa section"
+
+  "Well Pad B":
+    - "WPB"
+    - "WP-B"
+    - "WP_B"
+    - "wp b"
+    - "wellpad b"
+
+  "Compressor Station B":
+    - "CSB"
+    - "comp station b"
+    - "compressor stn b"
+    - "cs b"
+    - "compressor b"
+    - "comp stn b"
+
+  "Compressor Station A":
+    - "CSA"
+    - "comp station a"
+    - "compressor stn a"
+    - "cs a"
+    - "compressor a"
+
+  "Right of Way":
+    - "ROW corridor"
+    - "row area"
+    - "pipeline corridor"
+
+  "Test Site":
+    - "testing site"
+    - "trial site"

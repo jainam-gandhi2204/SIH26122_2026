@@ -15,6 +15,7 @@ from app.importer import (
     ValidationError,
     import_to_db,
     parse_and_validate,
+    parse_dependencies,
 )
 
 
@@ -129,6 +130,53 @@ class ParseValidateSuccessTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(rows[1].dependencies, ["T101"])
 
+    def test_parse_dependencies_exhaustive(self):
+        """Regression tests for parse_dependencies helper handling all required formats."""
+        # single dependency works
+        self.assertEqual(parse_dependencies("CSB105"), ["CSB105"])
+        # two dependencies separated by comma work
+        self.assertEqual(parse_dependencies("CSB114,CSB115"), ["CSB114", "CSB115"])
+        self.assertEqual(parse_dependencies("CSB114, CSB115"), ["CSB114", "CSB115"])
+        # two dependencies separated by semicolon work
+        self.assertEqual(parse_dependencies("CSB114;CSB115"), ["CSB114", "CSB115"])
+        # whitespace is handled
+        self.assertEqual(parse_dependencies("  CSB114  ;  CSB115  "), ["CSB114", "CSB115"])
+        self.assertEqual(parse_dependencies("  CSB114  ,  CSB115  "), ["CSB114", "CSB115"])
+        # "-" produces zero dependencies
+        self.assertEqual(parse_dependencies("-"), [])
+        self.assertEqual(parse_dependencies(" - "), [])
+        # empty dependency produces zero dependencies
+        self.assertEqual(parse_dependencies(""), [])
+        self.assertEqual(parse_dependencies("   "), [])
+        self.assertEqual(parse_dependencies(None), [])
+        # mixed delimiters
+        self.assertEqual(parse_dependencies("CSB110, CSB111; CSB112"), ["CSB110", "CSB111", "CSB112"])
+        # duplicate handling
+        self.assertEqual(parse_dependencies("CSB114;CSB114"), ["CSB114"])
+
+    def test_semicolon_delimited_dependencies_in_csv(self):
+        """CSV with semicolon-separated dependencies like CSB114;CSB115 produces multiple dependencies."""
+        row_1 = "CSB114,Power Cable,Station B,28-Oct-2026,31-Oct-2026,-"
+        row_2 = "CSB115,Instrumentation,Station B,28-Oct-2026,02-Nov-2026,-"
+        row_3 = "CSB116,Control Panel,Station B,29-Oct-2026,31-Oct-2026,CSB114;CSB115"
+        rows, errors = parse_and_validate(_csv(row_1, row_2, row_3), "test.csv")
+        self.assertEqual(errors, [])
+        self.assertEqual(len(rows), 3)
+        csb116 = next(r for r in rows if r.source_task_id == "CSB116")
+        self.assertEqual(csb116.dependencies, ["CSB114", "CSB115"])
+
+    def test_mixed_delimiter_dependencies_in_csv(self):
+        """CSV with mixed comma and semicolon dependencies like 'CSB110, CSB111; CSB112'."""
+        row_0 = "CSB110,Lube Oil,Station B,13-Oct-2026,17-Oct-2026,-"
+        row_1 = "CSB111,Cooling Water,Station B,18-Oct-2026,22-Oct-2026,-"
+        row_2 = "CSB112,Process Piping,Station B,23-Oct-2026,27-Oct-2026,-"
+        row_3 = ["CSB117", "Inspection", "Station B", "06-Nov-2026", "08-Nov-2026", "CSB110, CSB111; CSB112"]
+        rows, errors = parse_and_validate(_csv(row_0, row_1, row_2, row_3), "test.csv")
+        self.assertEqual(errors, [])
+        self.assertEqual(len(rows), 4)
+        csb117 = next(r for r in rows if r.source_task_id == "CSB117")
+        self.assertEqual(csb117.dependencies, ["CSB110", "CSB111", "CSB112"])
+
 
 # ---------------------------------------------------------------------------
 # parse_and_validate – validation-error tests
@@ -204,6 +252,17 @@ class ParseValidateErrorTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("TXXX", errors[0].message)
         self.assertEqual(errors[0].task_id, "T107")
+
+    def test_invalid_dependency_in_semicolon_list_rejected(self):
+        """If one ID in 'CSB114;NONEXISTENT' is unknown, a ValidationError is produced."""
+        row_1 = "CSB114,Power Cable,Station B,28-Oct-2026,31-Oct-2026,-"
+        row_2 = "CSB116,Control Panel,Station B,29-Oct-2026,31-Oct-2026,CSB114;NONEXISTENT"
+        rows, errors = parse_and_validate(_csv(row_1, row_2), "test.csv")
+        self.assertEqual(len(errors), 1)
+        self.assertIn("NONEXISTENT", errors[0].message)
+        self.assertEqual(errors[0].task_id, "CSB116")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].source_task_id, "CSB114")
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +623,128 @@ class IdempotencyTests(unittest.TestCase):
         self.assertTrue(any("DELETE FROM task_dependencies" in s for s in sql_calls))
         self.assertTrue(any("DELETE FROM schedule_tasks" in s for s in sql_calls))
         self.assertTrue(any("UPDATE ai_processed_updates SET matched_task_id = NULL" in s for s in sql_calls))
+        self.assertTrue(any("UPDATE site_updates" in s and "archived_at = :archived_at" in s for s in sql_calls))
+
+    def test_import_to_db_replace_archives_site_updates_while_non_replace_does_not(self):
+        """replace=True archives active site_updates with archived_at timestamp, whereas replace=False does not touch site_updates."""
+        db_replace = self._mock_db()
+        rows = [
+            ParsedRow("P101", "Survey", "Site 1",
+                      datetime.date(2026, 10, 1), datetime.date(2026, 10, 5), dependencies=[]),
+        ]
+        import_to_db(db_replace, rows, "new_schedule.csv", replace=True)
+        sql_calls_replace = self._sql_texts(db_replace)
+        self.assertTrue(any("UPDATE site_updates" in s and "SET archived_at = :archived_at" in s and "WHERE archived_at IS NULL" in s for s in sql_calls_replace))
+
+        db_normal = self._mock_db()
+        import_to_db(db_normal, rows, "same_schedule.csv", replace=False)
+        sql_calls_normal = self._sql_texts(db_normal)
+        self.assertFalse(any("UPDATE site_updates" in s for s in sql_calls_normal))
+
+
+class CSBScheduleDependencyImportTests(unittest.TestCase):
+    """Regression tests for importing CSB101–CSB120 schedule with single and multi-dependencies."""
+
+    def test_import_csb101_to_csb120_schedule_creates_correct_dependency_records(self):
+        """Verify:
+        - CSB101–CSB120 (20 tasks) imported
+        - Correct total number of dependency records (23)
+        - Specifically verify:
+            CSB116 -> CSB114
+            CSB116 -> CSB115
+        - Verify other multi-dependency tasks:
+            CSB117 -> CSB110, CSB111, CSB112
+            CSB119 -> CSB117, CSB118
+            CSB120 -> CSB119
+        """
+        csb_rows = [
+            # Task ID, Activity, Location, Start, End, Dependency
+            ["CSB101", "Site Survey and Setting Out", "Compressor Station B", "10-Sep-2026", "12-Sep-2026", "-"],
+            ["CSB102", "Site Clearing and Grading", "Compressor Station B", "13-Sep-2026", "16-Sep-2026", "CSB101"],
+            ["CSB103", "Excavation for Compressor Foundation", "Compressor Station B", "17-Sep-2026", "21-Sep-2026", "CSB102"],
+            ["CSB104", "Foundation Reinforcement Installation", "Compressor Station B", "22-Sep-2026", "25-Sep-2026", "CSB103"],
+            ["CSB105", "Compressor Foundation Installation", "Compressor Station B", "26-Sep-2026", "30-Sep-2026", "CSB104"],
+            ["CSB106", "Foundation Concrete Curing", "Compressor Station B", "01-Oct-2026", "05-Oct-2026", "CSB105"],
+            ["CSB107", "Equipment Base Plate Installation", "Compressor Station B", "06-Oct-2026", "08-Oct-2026", "CSB106"],
+            ["CSB108", "Compressor Skid Installation", "Compressor Station B", "09-Oct-2026", "12-Oct-2026", "CSB107"],
+            ["CSB109", "Compressor Alignment", "Compressor Station B", "13-Oct-2026", "15-Oct-2026", "CSB108"],
+            ["CSB110", "Lube Oil System Installation", "Compressor Station B", "13-Oct-2026", "17-Oct-2026", "CSB109"],
+            ["CSB111", "Cooling Water Piping Installation", "Compressor Station B", "18-Oct-2026", "22-Oct-2026", "CSB110"],
+            ["CSB112", "Process Piping Connection", "Compressor Station B", "23-Oct-2026", "27-Oct-2026", "CSB111"],
+            ["CSB113", "Electrical Cable Tray Installation", "Compressor Station B", "23-Oct-2026", "27-Oct-2026", "CSB112"],
+            ["CSB114", "Power Cable Installation", "Compressor Station B", "28-Oct-2026", "31-Oct-2026", "CSB113"],
+            ["CSB115", "Instrumentation Installation", "Compressor Station B", "28-Oct-2026", "02-Nov-2026", "CSB114"],
+            # Multi-dependency with semicolon:
+            ["CSB116", "Control Panel Installation", "Compressor Station B", "29-Oct-2026", "31-Oct-2026", "CSB114;CSB115"],
+            # Multi-dependency with comma:
+            ["CSB117", "Mechanical Inspection", "Compressor Station B", "06-Nov-2026", "08-Nov-2026", "CSB110, CSB111, CSB112"],
+            ["CSB118", "Electrical and Instrumentation Testing", "Compressor Station B", "09-Nov-2026", "11-Nov-2026", "CSB116"],
+            # Multi-dependency with comma:
+            ["CSB119", "Compressor Trial Run", "Compressor Station B", "12-Nov-2026", "14-Nov-2026", "CSB117, CSB118"],
+            # Single dependency:
+            ["CSB120", "Final Commissioning and Handover", "Compressor Station B", "15-Nov-2026", "17-Nov-2026", "CSB119"],
+        ]
+
+        csv_bytes = _csv(*csb_rows)
+        parsed_rows, errors = parse_and_validate(csv_bytes, "csb_schedule.csv")
+        self.assertEqual(errors, [], f"Unexpected errors: {errors}")
+        self.assertEqual(len(parsed_rows), 20)
+
+        # Verify parsed dependencies on individual tasks
+        csb116_parsed = next(r for r in parsed_rows if r.source_task_id == "CSB116")
+        self.assertEqual(csb116_parsed.dependencies, ["CSB114", "CSB115"])
+
+        csb117_parsed = next(r for r in parsed_rows if r.source_task_id == "CSB117")
+        self.assertEqual(csb117_parsed.dependencies, ["CSB110", "CSB111", "CSB112"])
+
+        csb119_parsed = next(r for r in parsed_rows if r.source_task_id == "CSB119")
+        self.assertEqual(csb119_parsed.dependencies, ["CSB117", "CSB118"])
+
+        csb120_parsed = next(r for r in parsed_rows if r.source_task_id == "CSB120")
+        self.assertEqual(csb120_parsed.dependencies, ["CSB119"])
+
+        # Now test import_to_db creates all 23 dependency records in PostgreSQL
+        db = MagicMock()
+        db.execute.return_value = MagicMock()
+        result = import_to_db(db, parsed_rows, "csb_schedule.csv")
+
+        self.assertEqual(result.tasks_imported, 20)
+        self.assertEqual(result.dependencies_imported, 23)
+
+        # Inspect DB executed calls to map UUIDs back to source_task_id
+        uuid_to_source: dict[str, str] = {}
+        for call_args in db.execute.call_args_list:
+            sql_text = str(call_args[0][0])
+            if "INSERT INTO schedule_tasks" in sql_text:
+                p = call_args[0][1] if len(call_args[0]) > 1 else call_args[1]
+                uuid_to_source[p["id"]] = p["source_task_id"]
+
+        inserted_deps: list[tuple[str, str]] = []
+        for call_args in db.execute.call_args_list:
+            sql_text = str(call_args[0][0])
+            if "INSERT INTO task_dependencies" in sql_text:
+                p = call_args[0][1] if len(call_args[0]) > 1 else call_args[1]
+                downstream = uuid_to_source[p["task_id"]]
+                upstream = uuid_to_source[p["depends_on_task_id"]]
+                inserted_deps.append((downstream, upstream))
+
+        self.assertEqual(len(inserted_deps), 23)
+
+        # Specifically verify CSB116 -> CSB114 and CSB116 -> CSB115
+        self.assertIn(("CSB116", "CSB114"), inserted_deps)
+        self.assertIn(("CSB116", "CSB115"), inserted_deps)
+
+        # Specifically verify CSB117 -> CSB110, CSB111, CSB112
+        self.assertIn(("CSB117", "CSB110"), inserted_deps)
+        self.assertIn(("CSB117", "CSB111"), inserted_deps)
+        self.assertIn(("CSB117", "CSB112"), inserted_deps)
+
+        # Specifically verify CSB119 -> CSB117, CSB118
+        self.assertIn(("CSB119", "CSB117"), inserted_deps)
+        self.assertIn(("CSB119", "CSB118"), inserted_deps)
+
+        # Specifically verify CSB120 -> CSB119
+        self.assertIn(("CSB120", "CSB119"), inserted_deps)
 
 
 if __name__ == "__main__":

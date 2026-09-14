@@ -14,6 +14,29 @@ GeminiAIProvider calls the Gemini API via google-genai and requests
 structured JSON output.  It reads GEMINI_API_KEY from the environment and
 falls back to MockAIProvider behaviour if the model returns unparseable data.
 
+Domain Aliases
+--------------
+Both providers apply alias normalization from
+backend/app/config/domain_aliases.yaml before matching.
+This maps informal/abbreviated terms to canonical schedule terms so that
+"WPA" → "Well Pad A", "ROW" → "Right of Way Clearance", "excvation" → "Excavation Work", etc.
+
+Confidence Design
+-----------------
+Confidence is computed as a COMPOSITE of:
+  - LLM semantic match confidence (40%)
+  - Deterministic multi-signal shortlist score (30%)
+  - LLM extraction clarity confidence (20%)
+  - Location agreement bonus (10%)
+
+This prevents blind trust in the LLM's self-reported score and grounds
+confidence in objective, auditable signals.
+
+Tiers (aligned with ai_processor.py):
+  HIGH  >= 80.0 → auto-link, update schedule actuals
+  MEDIUM 50.0–79.9 → planner review
+  LOW   < 50.0 → unmatched review (matched_task_id set to None)
+
 Usage
 -----
 Call `get_provider()` to obtain the configured provider.  It reads
@@ -28,21 +51,155 @@ import logging
 import os
 import re
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Result dataclass
+# Domain alias system
 # ---------------------------------------------------------------------------
+
+def _default_aliases() -> dict[str, dict[str, list[str]]]:
+    """Return an empty alias structure as a safe fallback."""
+    return {"activity_aliases": {}, "location_aliases": {}}
+
+
+def load_domain_aliases(
+    config_path: str | Path | None = None,
+) -> dict[str, dict[str, list[str]]]:
+    """Load domain aliases from YAML config.
+
+    Falls back to an empty alias dict if PyYAML is not installed or the
+    config file is missing.  This makes the alias system purely additive:
+    the core matching logic always works even without aliases.
+
+    Parameters
+    ----------
+    config_path:
+        Explicit path to the YAML file.  If None, resolves relative to
+        this source file: ../config/domain_aliases.yaml
+    """
+    if config_path is None:
+        config_path = Path(__file__).parent / "config" / "domain_aliases.yaml"
+    config_path = Path(config_path)
+    if not config_path.exists():
+        logger.debug("domain_aliases.yaml not found at %s — aliases disabled.", config_path)
+        return _default_aliases()
+    try:
+        import yaml  # type: ignore[import]
+        with open(config_path, encoding="utf-8") as fh:
+            data = yaml.safe_load(fh)
+        if not isinstance(data, dict):
+            return _default_aliases()
+        return {
+            "activity_aliases": data.get("activity_aliases") or {},
+            "location_aliases": data.get("location_aliases") or {},
+        }
+    except ImportError:
+        logger.debug("PyYAML not installed — domain aliases disabled.")
+        return _default_aliases()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to load domain_aliases.yaml: %s", exc)
+        return _default_aliases()
+
+
+def _build_alias_map(
+    alias_dict: dict[str, list[str]],
+) -> list[tuple[str, str]]:
+    """Build a sorted (longest-first) list of (alias_lower, canonical) pairs.
+
+    Longest-first ensures a more specific alias matches before a shorter one
+    that might be a substring of it (e.g., "ROW corridor" before "ROW").
+    """
+    pairs: list[tuple[str, str]] = []
+    for canonical, aliases in alias_dict.items():
+        if not isinstance(aliases, list):
+            continue
+        for alias in aliases:
+            if alias and isinstance(alias, str):
+                pairs.append((alias.lower(), canonical))
+    # Sort by alias length descending so longer matches take priority
+    pairs.sort(key=lambda p: -len(p[0]))
+    return pairs
+
+
+def normalize_with_aliases(
+    text: str,
+    alias_pairs: list[tuple[str, str]],
+) -> str:
+    """Apply alias normalization to text.
+
+    For each (alias, canonical) pair (sorted longest-first), replace whole-word
+    occurrences of the alias with the canonical term.  Case-insensitive.
+
+    Returns the normalized text.
+    """
+    if not text or not alias_pairs:
+        return text
+    result = text
+    for alias_lower, canonical in alias_pairs:
+        # Use word-boundary match; escape special regex chars in alias
+        pattern = r"(?<!\w)" + re.escape(alias_lower) + r"(?!\w)"
+        try:
+            result = re.sub(pattern, canonical, result, flags=re.IGNORECASE)
+        except re.error:
+            # Malformed alias pattern — skip silently
+            continue
+    return result
+
+
+# Module-level cached aliases (loaded once at import time)
+_DOMAIN_ALIASES: dict[str, dict[str, list[str]]] = load_domain_aliases()
+_ACTIVITY_ALIAS_PAIRS: list[tuple[str, str]] = _build_alias_map(
+    _DOMAIN_ALIASES.get("activity_aliases", {})
+)
+_LOCATION_ALIAS_PAIRS: list[tuple[str, str]] = _build_alias_map(
+    _DOMAIN_ALIASES.get("location_aliases", {})
+)
+_ALL_ALIAS_PAIRS: list[tuple[str, str]] = _build_alias_map(
+    {**_DOMAIN_ALIASES.get("activity_aliases", {}), **_DOMAIN_ALIASES.get("location_aliases", {})}
+)
+
+
+# ---------------------------------------------------------------------------
+# Result dataclasses
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ActivityObservation:
+    """A single activity observation extracted from a site update.
+
+    Used for multi-activity extraction.  One site update may produce multiple
+    observations (e.g., "pipeline laid + welding done at WPA").
+
+    Phase 1: These are stored in model_response.additional_observations.
+    Phase 2: Each observation can be persisted as a separate DB row.
+    """
+    activity_description: str           # What the update says about this activity
+    location_mentioned: str | None      # Location as mentioned (may be alias)
+    progress_percent: float | None      # Extracted progress (FACT only)
+    status: str | None                  # Extracted status (INFERENCE ok)
+    delay_days: int | None              # Delay in days (FACT only)
+    delay_reason: str | None            # Delay reason (INFERENCE ok)
+    extraction_confidence: float        # How clearly this observation was stated (0–100)
+    candidate_source_task_id: str | None  # Best candidate task for this observation
+
 
 @dataclass
 class AnalysisResult:
     """All fields that map directly to the ai_processed_updates table columns.
 
     None means UNKNOWN – value not stated in or safely inferable from the text.
+
+    Confidence Design:
+    - confidence_score is a COMPOSITE, not the raw LLM score.
+    - matched_task_id is None when confidence < 50.0 (no false match stored).
+    - model_response contains: reasoning, confidence_tier, is_ambiguous,
+      extraction_confidence, match_confidence, deterministic_score,
+      and additional_observations for multi-activity cases.
     """
     matched_task_id: str | None          # UUID of schedule_tasks row, or None
     progress_percent: float | None       # 0–100; None = UNKNOWN
@@ -51,7 +208,7 @@ class AnalysisResult:
     delay_reason: str | None             # free text; None = UNKNOWN
     actual_start_date: str | None        # ISO date string; None = UNKNOWN
     actual_end_date: str | None          # ISO date string; None = UNKNOWN
-    confidence_score: float              # 0–100
+    confidence_score: float              # 0–100 COMPOSITE score
     model_name: str
     model_response: dict[str, Any]       # full model output for audit trail
 
@@ -81,12 +238,55 @@ class AIProvider(ABC):
         candidate_tasks:  List of schedule task dicts with keys:
                           id, source_task_id, activity, location,
                           planned_start (ISO str), planned_end (ISO str).
+                          These are the shortlisted candidates from ai_processor.
 
         Returns
         -------
         AnalysisResult with only FACT or INFERENCE values populated.
         Anything that cannot be determined is left as None.
+        matched_task_id is None when confidence < 50.0.
         """
+
+
+# ---------------------------------------------------------------------------
+# Composite confidence computation
+# ---------------------------------------------------------------------------
+
+def compute_composite_confidence(
+    llm_confidence: float,
+    llm_extraction_confidence: float,
+    deterministic_score: float,
+    location_match_score: int,
+) -> float:
+    """Compute a composite confidence score from multiple independent signals.
+
+    This prevents blind trust in the LLM's self-reported confidence number.
+    The formula combines:
+    - LLM semantic match confidence (40%): how certain the model is of the match
+    - Deterministic shortlist score (30%): keyword/location/date signals
+    - LLM extraction clarity (20%): how clearly the update was stated
+    - Location agreement bonus (10%): explicit location signal
+
+    Parameters
+    ----------
+    llm_confidence:             LLM's reported match confidence (0–100).
+    llm_extraction_confidence:  LLM's reported extraction confidence (0–100).
+    deterministic_score:        Score from deterministic shortlisting (0–100).
+    location_match_score:       0=none, 1=partial, 2=alias, 3=exact (scaled to 0–100).
+
+    Returns
+    -------
+    Composite score in [0.0, 100.0].
+    """
+    _LOC_NORMALIZED = {0: 0.0, 1: 33.0, 2: 67.0, 3: 100.0}
+    location_normalized = _LOC_NORMALIZED.get(location_match_score, 0.0)
+    composite = (
+        0.40 * max(0.0, min(100.0, llm_confidence))
+        + 0.30 * max(0.0, min(100.0, deterministic_score))
+        + 0.20 * max(0.0, min(100.0, llm_extraction_confidence))
+        + 0.10 * location_normalized
+    )
+    return round(min(100.0, max(0.0, composite)), 2)
 
 
 # ---------------------------------------------------------------------------
@@ -94,20 +294,36 @@ class AIProvider(ABC):
 # ---------------------------------------------------------------------------
 
 _STATUS_KEYWORDS: dict[str, str] = {
+    # IMPORTANT: Check longer/negation/qualification phrases BEFORE shorter positive substrings.
+    # "not start" must come before "started"; "yet to start" before "start".
+    "not start": "not_started",
+    "yet to start": "not_started",
+    # Vague progress qualifications must map to in_progress (progress_percent stays None)
+    "almost complete": "in_progress",
+    "almost done": "in_progress",
+    "almost finish": "in_progress",
+    "nearly complete": "in_progress",
+    "nearly done": "in_progress",
     "complet": "completed",
     "finish": "completed",
     "done": "completed",
+    "signed off": "completed",
+    "sign off": "completed",
+    "handed over": "completed",
     "in progress": "in_progress",
     "ongoing": "in_progress",
     "started": "in_progress",
     "underway": "in_progress",
+    "continuing": "in_progress",
+    "proceeding": "in_progress",
     "delay": "delayed",
     "behind": "delayed",
-    "not start": "not_started",
-    "yet to start": "not_started",
+    "overdue": "delayed",
     "block": "blocked",
     "halt": "blocked",
     "stopp": "blocked",
+    "suspend": "blocked",
+    "paused": "blocked",
 }
 
 _PROGRESS_PATTERNS: list[tuple[re.Pattern[str], float | None]] = [
@@ -280,21 +496,65 @@ def _extract_delay_days(text: str) -> int | None:
 _STOP_WORDS = frozenset({
     "the", "at", "is", "of", "and", "in", "to", "for", "with", "a", "an",
     "on", "by", "from", "as", "about", "around", "approximately", "roughly",
-    "complete", "completed", "progress", "due", "site", "pad", "work"
+    "complete", "completed", "progress", "due", "site", "pad", "work",
+    "aaj", "kal", "hai", "kar", "raha", "karenge", "karna",  # Hinglish
 })
 
 _ACTIVITY_SYNONYMS: dict[str, list[str]] = {
-    "excavat": ["excavation", "excavating", "excavated", "excavate", "earthwork", "digging", "trenched", "trenching"],
+    "excavat": ["excavation", "excavating", "excavated", "excavate", "earthwork", "digging", "trenched", "trenching", "excvation", "exvacation"],
     "clear": ["clearing", "clearance", "cleared", "site prep", "site preparation", "grubbing", "grading"],
     "cast": ["casting", "cast", "concreting", "concrete", "pour", "pouring", "poured"],
     "foundat": ["foundation", "foundations", "substructure", "footing", "footings"],
     "install": ["installation", "install", "installed", "installing", "erection", "erecting", "mount", "mounting"],
     "equip": ["equipment", "machinery", "skid", "generator", "pump", "compressor", "vessel"],
-    "pipe": ["piping", "pipeline", "pipe", "pipe laying", "pipework", "flowline"],
+    "pipe": ["piping", "pipeline", "pipe", "pipe laying", "pipework", "flowline", "stringing", "pipe stringing"],
     "weld": ["welding", "weld", "welded", "tie-in", "joint", "jointing"],
     "commiss": ["commissioning", "commission", "commissioned", "pre-commissioning", "handover"],
     "test": ["testing", "test", "tested", "hydrotest", "hydrotesting", "pressure test"],
+    "row": ["row", "row clearing", "row clearance", "right of way", "corridor clearing"],
+    "way": ["row", "row clearing", "row clearance", "right of way", "corridor clearing"],
 }
+
+
+
+def _location_match_score(task_loc: str, loc_lower: str, raw_lower: str) -> int:
+    """Return a location match score: 3=exact, 2=alias-normalized, 1=partial, 0=none.
+
+    task_loc:  The task's canonical location (from schedule DB), already lowercase.
+    loc_lower: The update's reported location, already lowercase.
+    raw_lower: The raw update text, already lowercase (original, un-normalized).
+
+    We normalize the INCOMING text (loc_lower, raw_lower) with aliases so that
+    informal terms like "WPA" map to "Well Pad A" for comparison.  We do NOT
+    re-normalize task_loc because it is already the canonical schedule value.
+    """
+    if not task_loc:
+        return 0
+
+    # Normalize the incoming location/text with aliases (informal → canonical)
+    # so "WPA" → "well pad a" for comparison
+    norm_update_loc = normalize_with_aliases(loc_lower, _LOCATION_ALIAS_PAIRS).lower()
+    norm_raw = normalize_with_aliases(raw_lower, _LOCATION_ALIAS_PAIRS).lower()
+    # task_loc is already canonical — compare directly (no re-normalization)
+    task_loc_norm = task_loc  # already lowercase, already canonical
+
+    # Exact match: reported location == task location (after alias expansion)
+    if task_loc_norm == norm_update_loc:
+        return 3
+    # Task location appears in the normalized raw update text
+    if task_loc_norm in norm_raw:
+        return 2
+    # Task location verbatim in the original raw text (direct mention)
+    if task_loc_norm in raw_lower:
+        return 2
+    # Partial: update location is a substring of the task location
+    if loc_lower and loc_lower in task_loc_norm:
+        return 1
+    # Partial: task location is a substring of the update location
+    if task_loc_norm in loc_lower:
+        return 1
+
+    return 0
 
 
 def score_candidate_task(
@@ -302,22 +562,44 @@ def score_candidate_task(
     raw_update: str,
     location: str,
 ) -> float:
-    """Calculate match score (0.0 to 100.0) between a task and site update."""
-    raw_lower = raw_update.lower()
-    task_act = str(task.get("activity", "")).strip().lower()
+    """Calculate keyword-based match score (0.0 to 100.0) between a task and site update.
+
+    Applies alias normalization before scoring so that "excvation" and "ROW"
+    are recognized as matching schedule activities containing "excavation" and
+    "Right of Way".
+
+    If base activity keyword score is 0 but location match is strong (score >= 2),
+    a location-only base score of 40.0 is used so that vague updates at a known
+    location can still be tentatively matched (for planner review).
+    """
+    # Apply alias normalization to both raw update and task activity
+    norm_raw = normalize_with_aliases(raw_update, _ALL_ALIAS_PAIRS)
+    raw_lower = norm_raw.lower()
+
+    task_act_orig = str(task.get("activity", "")).strip()
+    task_act = normalize_with_aliases(task_act_orig, _ALL_ALIAS_PAIRS).strip().lower()
     task_loc = str(task.get("location", "")).strip().lower()
     loc_lower = location.strip().lower()
 
-    # Extract distinctive activity tokens
+    # Extract distinctive activity tokens (from normalized task activity)
     act_words = [w for w in re.findall(r"\w+", task_act) if len(w) > 2]
     distinctive = [w for w in act_words if w not in _STOP_WORDS]
     if not distinctive:
         distinctive = act_words
 
+    # Location agreement bonus: 0=none, 1=partial(+3), 2=alias/text(+7), 3=exact(+10)
+    loc_score = _location_match_score(task_loc, loc_lower, raw_update.lower())
+    _LOC_BONUS = {0: 0.0, 1: 3.0, 2: 7.0, 3: 10.0}
+    location_bonus = _LOC_BONUS[loc_score]
+
     if not distinctive:
+        # No activity tokens at all (e.g., activity="Work" with all stop words).
+        # Use location-only score if location matches.
+        if loc_score >= 2:
+            return min(100.0, 40.0 + location_bonus)
         return 0.0
 
-    # Check exact phrase or cleaned phrase
+    # Check exact phrase or cleaned phrase (normalized)
     clean_phrase = " ".join(distinctive)
     if task_act in raw_lower or clean_phrase in raw_lower:
         base_score = 95.0
@@ -328,11 +610,11 @@ def score_candidate_task(
             if re.search(r"\b" + re.escape(tok) + r"\b", raw_lower):
                 matched_tokens += 1
                 continue
-            # stem/synonym in update
+            # stem/synonym in update (check normalized synonyms with word boundaries)
             found_stem = False
             for root, syns in _ACTIVITY_SYNONYMS.items():
                 if tok.startswith(root) or any(s in tok for s in syns):
-                    if any(re.search(r"\b" + re.escape(s) + r"\b", raw_lower) or s in raw_lower for s in syns):
+                    if any(re.search(r"\b" + re.escape(s) + r"\b", raw_lower) for s in syns):
                         matched_tokens += 1
                         found_stem = True
                         break
@@ -345,15 +627,15 @@ def score_candidate_task(
             ratio = matched_tokens / len(distinctive)
             base_score = 50.0 + (ratio * 35.0)
         else:
-            base_score = 0.0
+            # No keyword match — but strong location match can provide a fallback score
+            if loc_score >= 2:
+                base_score = 40.0  # location-only tentative match → score: 40+7=47 or 40+10=50
+            else:
+                base_score = 0.0
+
 
     if base_score == 0.0:
         return 0.0
-
-    # Location agreement bonus (+5)
-    location_bonus = 0.0
-    if task_loc and (task_loc == loc_lower or task_loc in raw_lower or loc_lower in task_loc):
-        location_bonus = 5.0
 
     return min(100.0, base_score + location_bonus)
 
@@ -365,10 +647,14 @@ def evaluate_task_matches(
 ) -> tuple[str | None, float, dict[str, Any]]:
     """Match update to candidate tasks and return (matched_task_id, confidence_score, metadata).
 
-    Tiers:
-    - High confidence (>= 75.0): single clear candidate, auto-link.
-    - Medium confidence (50.0 - 74.9): ambiguous match or tentative keyword overlap, requires planner review.
-    - Low confidence (< 50.0): no candidate matches, requires unmatched planner review.
+    Tiers (aligned with ai_processor.py auto-link logic):
+    - High confidence (>= 80.0): single clear candidate, eligible for auto-link.
+    - Medium confidence (50.0 – 79.9): tentative or ambiguous match, planner review.
+    - Low confidence (< 50.0): no reliable match → matched_task_id = None.
+
+    IMPORTANT: Low-confidence results return matched_task_id = None to prevent
+    false matches being stored in the database.  The suggested task is preserved
+    in the metadata under 'suggested_source_task_id' for planner reference.
     """
     if not candidate_tasks:
         return (
@@ -391,12 +677,12 @@ def evaluate_task_matches(
     scored.sort(key=lambda x: (-x[0], x[1].get("planned_start") or ""))
     top_score, top_task = scored[0]
 
-    if top_score >= 75.0:
+    if top_score >= 80.0:
         # Check ambiguity against second candidate
         if len(scored) > 1:
             second_score, second_task = scored[1]
-            if second_score >= 50.0 and (top_score - second_score < 20.0):
-                # Competing candidates -> Medium tier (ambiguous match for planner review)
+            if second_score >= 55.0 and (top_score - second_score < 20.0):
+                # Competing candidates → Medium tier (ambiguous match for planner review)
                 return (
                     top_task["id"],
                     60.0,
@@ -405,7 +691,11 @@ def evaluate_task_matches(
                         "matched_source_task_id": top_task.get("source_task_id"),
                         "is_ambiguous": True,
                         "ambiguity_competing_task_id": second_task.get("source_task_id"),
-                        "reasoning": f"Ambiguous match between {top_task.get('source_task_id')} and {second_task.get('source_task_id')} (close keyword scores). Requires planner review.",
+                        "reasoning": (
+                            f"Ambiguous match between {top_task.get('source_task_id')} "
+                            f"and {second_task.get('source_task_id')} "
+                            f"(close keyword scores). Requires planner review."
+                        ),
                     },
                 )
         # Unambiguous high confidence match
@@ -416,12 +706,15 @@ def evaluate_task_matches(
                 "confidence_tier": "high",
                 "matched_source_task_id": top_task.get("source_task_id"),
                 "is_ambiguous": False,
-                "reasoning": f"High-confidence match to {top_task.get('source_task_id')} ({top_task.get('activity')}) with {top_score:.1f}% confidence score.",
+                "reasoning": (
+                    f"High-confidence match to {top_task.get('source_task_id')} "
+                    f"({top_task.get('activity')}) with {top_score:.1f}% score."
+                ),
             },
         )
 
     if top_score >= 50.0:
-        # Medium confidence match -> Planner review
+        # Medium confidence match → Planner review
         return (
             top_task["id"],
             top_score,
@@ -429,25 +722,39 @@ def evaluate_task_matches(
                 "confidence_tier": "medium",
                 "matched_source_task_id": top_task.get("source_task_id"),
                 "is_ambiguous": False,
-                "reasoning": f"Medium-confidence tentative match to {top_task.get('source_task_id')} ({top_task.get('activity')}). Planner review recommended.",
+                "reasoning": (
+                    f"Medium-confidence tentative match to {top_task.get('source_task_id')} "
+                    f"({top_task.get('activity')}). Planner review recommended."
+                ),
             },
         )
 
-    # Low confidence fallback (candidate exists by date, but keyword score is low or absent)
+    # Low confidence: suggest the best available candidate but do NOT set matched_task_id.
+    # Returning None for matched_task_id prevents a false match being stored in the DB.
+    # Return a small confidence (25.0) that is higher than the no-candidate fallback (20.0)
+    # but clearly stays in the LOW tier (< 50.0).
     date_sorted = sorted(
         candidate_tasks,
         key=lambda t: (t.get("planned_end") or "", t.get("planned_start") or ""),
     )
-    fallback_task = date_sorted[0]
+    suggested_task = date_sorted[0]
+    # Use 25.0 when candidates exist (vs 20.0 for no-candidates), indicating
+    # "schedule was searched but no keyword match found"
+    low_conf = max(25.0, min(top_score, 45.0)) if top_score > 0.0 else 25.0
     return (
-        fallback_task["id"],
-        40.0,
+        None,  # NO false match stored
+        low_conf,
         {
             "confidence_tier": "low",
-            "matched_source_task_id": fallback_task.get("source_task_id"),
-            "suggested_source_task_id": fallback_task.get("source_task_id"),
+            "matched_source_task_id": None,
+            "suggested_source_task_id": suggested_task.get("source_task_id"),
+            "suggested_activity": suggested_task.get("activity"),
             "is_ambiguous": False,
-            "reasoning": f"Tentative date-based fallback to {fallback_task.get('source_task_id')} ({fallback_task.get('activity')}) with low confidence (40%). Requires planner review.",
+            "reasoning": (
+                f"No reliable match found (top keyword score: {top_score:.1f}%). "
+                f"Nearest candidate by date: {suggested_task.get('source_task_id')} "
+                f"({suggested_task.get('activity')}). Requires unmatched review."
+            ),
         },
     )
 
@@ -456,9 +763,12 @@ class MockAIProvider(AIProvider):
     """Deterministic keyword and activity-similarity analyser used when no real API is configured.
 
     Implements calibrated confidence tiers:
-    - High confidence (>= 75.0): auto-link
-    - Medium confidence (50.0 - 74.9): planner review with suggested match / ambiguity flag
-    - Low confidence (< 50.0): unmatched planner review
+    - High confidence (>= 80.0): auto-link eligible
+    - Medium confidence (50.0 – 79.9): planner review with suggested match / ambiguity flag
+    - Low confidence (< 50.0): unmatched review; matched_task_id = None
+
+    Applies domain alias normalization before matching, so "WPA", "ROW", "excvation", etc.
+    are recognized correctly.
     """
 
     def analyse(
@@ -468,14 +778,59 @@ class MockAIProvider(AIProvider):
         reported_on: str,
         candidate_tasks: list[dict[str, Any]],
     ) -> AnalysisResult:
-        text_lower = raw_update.lower()
+        # Normalize the raw update text with both activity and location aliases
+        norm_update = normalize_with_aliases(raw_update, _ALL_ALIAS_PAIRS)
+        text_lower = norm_update.lower()
 
         # --- Task matching with confidence tiers ---
-        matched_task_id, confidence, match_meta = evaluate_task_matches(
+        matched_task_id, raw_confidence, match_meta = evaluate_task_matches(
             candidate_tasks=candidate_tasks,
-            raw_update=raw_update,
+            raw_update=norm_update,  # use normalized text for matching
             location=location,
         )
+
+        # Compute location match score for composite confidence
+        loc_lower = location.strip().lower()
+        loc_score = 0
+        if matched_task_id:
+            matched_task = next((t for t in candidate_tasks if t["id"] == matched_task_id), None)
+            if matched_task:
+                loc_score = _location_match_score(
+                    matched_task.get("location", "").lower(),
+                    loc_lower,
+                    raw_update.lower(),
+                )
+
+        # Estimate extraction confidence: higher if update has explicit % or clear keywords
+        pct_match = re.search(r"(\d+(?:\.\d+)?)\s*%", raw_update)
+        has_explicit_percent = pct_match is not None
+        has_status_keyword = any(k in text_lower for k in _STATUS_KEYWORDS)
+        has_candidates = len(candidate_tasks) > 0
+
+        if not has_candidates:
+            # No tasks in schedule at all — very low extraction usefulness
+            extraction_conf = 15.0
+        elif has_explicit_percent and has_status_keyword:
+            extraction_conf = 90.0
+        elif has_explicit_percent or has_status_keyword:
+            extraction_conf = 75.0
+        elif len(raw_update.strip()) < 20:
+            extraction_conf = 40.0
+        else:
+            extraction_conf = 70.0
+
+        composite_confidence = compute_composite_confidence(
+            llm_confidence=raw_confidence,
+            llm_extraction_confidence=extraction_conf,
+            deterministic_score=raw_confidence,   # for mock, these are the same
+            location_match_score=loc_score,
+        )
+
+        # Enforce tier consistency: if composite falls below 50, clear matched_task_id
+        if composite_confidence < 50.0:
+            matched_task_id = None
+            match_meta["matched_source_task_id"] = None
+            match_meta["confidence_tier"] = "low"
 
         # --- Status (INFERENCE from keywords) ---
         status: str | None = None
@@ -486,7 +841,6 @@ class MockAIProvider(AIProvider):
 
         # --- Progress percent (FACT: only from explicit "X%" pattern) ---
         progress_percent: float | None = None
-        pct_match = re.search(r"(\d+(?:\.\d+)?)\s*%", raw_update)
         if pct_match:
             candidate = float(pct_match.group(1))
             if 0.0 <= candidate <= 100.0:
@@ -525,23 +879,32 @@ class MockAIProvider(AIProvider):
         actual_start_date: str | None = _extract_start_date(raw_update)
         actual_end_date: str | None = _extract_end_date(raw_update)
 
+        # --- Detect multiple activities mentioned (multi-activity readiness) ---
+        additional_observations = _detect_additional_activities(raw_update, candidate_tasks, location)
+
         # --- Build result ---
         model_response: dict[str, Any] = {
             "provider": _MOCK_MODEL_NAME,
             "text_analysed": raw_update[:500],
+            "normalized_text": norm_update[:500] if norm_update != raw_update else None,
             "matched_source_task_id": match_meta.get("matched_source_task_id"),
             "confidence_tier": match_meta.get("confidence_tier"),
             "is_ambiguous": match_meta.get("is_ambiguous", False),
             "reasoning": match_meta.get("reasoning", ""),
+            "extraction_confidence": extraction_conf,
+            "match_confidence": raw_confidence,
+            "composite_confidence": composite_confidence,
+            "location_match_score": loc_score,
             "matched_keywords": {
                 "status_keyword": next(
                     (k for k in _STATUS_KEYWORDS if k in text_lower), None
                 ),
-                "percent_pattern_found": pct_match is not None,
+                "percent_pattern_found": has_explicit_percent,
                 "delay_found": delay_days is not None,
                 "start_date_found": actual_start_date is not None,
                 "end_date_found": actual_end_date is not None,
             },
+            "additional_observations": additional_observations,
             "note": (
                 "Deterministic matching and confidence tiering. "
                 "Values marked UNKNOWN are None. "
@@ -558,10 +921,59 @@ class MockAIProvider(AIProvider):
             delay_reason=delay_reason,
             actual_start_date=actual_start_date,
             actual_end_date=actual_end_date,
-            confidence_score=confidence,
+            confidence_score=composite_confidence,
             model_name=_MOCK_MODEL_NAME,
             model_response=model_response,
         )
+
+
+def _detect_additional_activities(
+    raw_update: str,
+    candidate_tasks: list[dict[str, Any]],
+    location: str,
+) -> list[dict[str, Any]]:
+    """Detect mentions of additional activities beyond the primary match.
+
+    Used for multi-activity extraction readiness (Phase 1).
+    Returns a list of activity observations that scored >= 50.0 but were
+    not selected as the primary match.
+
+    This is a best-effort heuristic scan; the Gemini provider does this
+    more accurately via the structured prompt.
+    """
+    if len(candidate_tasks) < 2:
+        return []
+
+    norm_raw = normalize_with_aliases(raw_update, _ALL_ALIAS_PAIRS)
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for t in candidate_tasks:
+        score = score_candidate_task(t, norm_raw, location)
+        # Require score >= 55.0 so location-only fallback scores (<= 50.0 without
+        # keyword overlap) are not falsely treated as additional activity mentions
+        if score >= 55.0:
+            scored.append((score, t))
+
+
+    if len(scored) < 2:
+        return []
+
+    # Sort and skip the top (primary) match; return the rest as observations
+    scored.sort(key=lambda x: -x[0])
+    additional: list[dict[str, Any]] = []
+    for score, task in scored[1:]:
+        # Check for progress in raw_update (simple scan)
+        pct_m = re.search(r"(\d+(?:\.\d+)?)\s*%", raw_update)
+        obs: dict[str, Any] = {
+            "candidate_source_task_id": task.get("source_task_id"),
+            "activity": task.get("activity"),
+            "location": task.get("location"),
+            "keyword_score": round(score, 1),
+            "progress_percent": float(pct_m.group(1)) if pct_m else None,
+            "note": "Secondary activity mention detected by keyword scan.",
+        }
+        additional.append(obs)
+
+    return additional
 
 
 # ---------------------------------------------------------------------------
@@ -599,63 +1011,233 @@ _ALLOWED_STATUSES = frozenset(
 _GEMINI_MODEL = "gemini-3.6-flash"
 
 _SYSTEM_PROMPT = """\
-You are a construction-project analyst.
-You will be given a raw site update report and a list of planned schedule tasks.
+You are an expert construction-project analyst specialising in oil & gas pipeline, well pad, and compressor station projects.
 
-Your job is to analyse the update and return a JSON object with these fields:
+You will be given:
+1. A raw site update from a field supervisor or engineer (may be informal, abbreviated, or contain typos).
+2. A list of planned schedule tasks with their IDs, activity names, locations, and dates.
 
-- matched_source_task_id (string or null):
-    The source_task_id of the planned task that this update most likely refers to.
-    Base this on the location and activity keywords in the update.
-    Set to null if the update cannot be matched to any task.
+Your job is to:
+PHASE 1 — EXTRACT what the update says (extraction).
+PHASE 2 — MATCH it to the most appropriate schedule task (matching).
+
+Return a single JSON object with ALL of the following fields:
+
+=== EXTRACTION FIELDS ===
 
 - progress_percent (number 0-100 or null):
-    FACT only. Extract this if the update explicitly states a percentage for
-    the relevant work, even with approximation qualifiers such as "around",
-    "approximately", "roughly", or "about"
-    (e.g. "75% complete", "around 40% complete", "roughly half done" → 50).
-    The percentage must be clearly stated by the reporter — do not estimate or
-    invent one. Set to null only when no percentage figure is mentioned at all.
-    Exception: if status is "completed" with no percentage stated, set to 100.
+    FACT ONLY. Extract if the update explicitly states a percentage for the work.
+    Approximation qualifiers like "around", "approximately", "roughly", "about" are ACCEPTABLE
+    (e.g., "around 40% complete" → 40, "roughly half done" → 50).
+    "almost done" or "nearly complete" → null (no number stated).
+    Do NOT estimate or invent a number. Set to null when no percentage figure is mentioned.
+    Exception: if status is "completed" or "signed off" with no percentage stated, set to 100.
 
 - status (string or null):
-    One of: "not_started", "in_progress", "completed", "delayed", "blocked".
-    INFERENCE is acceptable here based on the language of the update.
-    Set to null if you cannot determine this with reasonable confidence.
+    One of ONLY: "not_started", "in_progress", "completed", "delayed", "blocked".
+    INFERENCE from the language of the update is acceptable here.
+    Examples: "guys finished" → "completed", "delayed by rain" → "delayed", "paused" → "blocked".
+    Set to null if you cannot determine with reasonable confidence.
 
 - delay_days (integer >= 0 or null):
-    FACT only. Set only if the update explicitly states a number of days of delay
-    (e.g. "delayed by 3 days"). Do not estimate. Set to null otherwise.
+    FACT ONLY. Set only if the update explicitly states a number of days of delay.
+    "two-day delay" → 2. "delayed by rain" → null (no count stated). Do NOT estimate.
 
 - delay_reason (string or null):
-    INFERENCE acceptable. A short phrase describing why the delay or blockage
-    occurred. Set to null if status is not "delayed" or "blocked", or if no
-    reason can be inferred.
+    INFERENCE acceptable. Short phrase describing why the delay/blockage occurred.
+    Set to null if status is not "delayed" or "blocked", or no reason can be inferred.
 
 - actual_start_date (string "YYYY-MM-DD" or null):
-    FACT only. Set only if the update explicitly states that work has started
-    on a specific date. Do not infer. Set to null otherwise.
+    FACT ONLY. Set only if the update explicitly states that work started on a specific date.
+    "started today" or "started yesterday" → null (relative dates are not extractable as facts).
 
 - actual_end_date (string "YYYY-MM-DD" or null):
-    FACT only. Set only if the update explicitly states that work was completed
-    on a specific date. Do not infer. Set to null otherwise.
+    FACT ONLY. Set only if the update explicitly states completion on a specific date.
+
+- extraction_confidence (number 0-100):
+    How clearly and explicitly the update stated extractable facts.
+    90-100: explicit percentages, dates, and status clearly stated.
+    60-89: status inferred from clear language, some facts stated.
+    30-59: vague language, significant inference needed.
+    0-29: update is ambiguous, unrelated, or unintelligible.
+
+=== MATCHING FIELDS ===
+
+- matched_source_task_id (string or null):
+    The source_task_id of the planned task this update most likely refers to.
+    Use ALL available signals: activity type, location match, date proximity, activity state.
+    Set to null if no task is a plausible match (e.g., "lunch break at 1pm").
+
+- match_confidence (number 0-100):
+    Your confidence specifically in the task identification match.
+    90-100: unambiguous match — activity, location, and context all strongly align.
+    70-89: clear match with minor uncertainty (e.g., location inferred from text).
+    50-69: plausible match but some signals are missing or ambiguous.
+    20-49: weak match, only one signal aligns.
+    0-19: no real match found.
 
 - confidence_score (number 0-100):
-    Your confidence in the overall analysis. Use:
-    80-100 for very clear updates with explicit facts.
-    50-79 for updates where some inference was needed.
-    20-49 for vague updates with significant uncertainty.
-    0-19 for updates you could not meaningfully interpret.
+    Overall confidence: set this equal to min(extraction_confidence, match_confidence).
+    Both extraction AND matching must be confident for this to be high.
 
 - reasoning (string):
-    A one or two sentence explanation of why you made these choices.
-    This is stored for audit purposes.
+    1-3 sentences explaining your match decision and what facts/inferences you made.
+    Be explicit: state which signals (activity keywords, location, date) drove the decision.
+    Always mark extractions as FACT or INFERENCE.
 
-CRITICAL RULES:
-1. Never invent dates, percentages, or delay counts.
-2. If a value is UNKNOWN, set it to null — do not guess.
-3. Return only valid JSON. No markdown fences, no extra text.
+=== MULTI-ACTIVITY FIELD ===
+
+- additional_observations (array or null):
+    If the update mentions more than one distinct schedule activity, list the additional
+    observations here (beyond the primary matched one). For each additional activity:
+    {
+        "candidate_source_task_id": "...",  // best candidate, or null
+        "activity_description": "...",       // what the update says about this activity
+        "progress_percent": <number or null>,
+        "status": <string or null>,
+        "extraction_confidence": <number>
+    }
+    Set to null or empty array if only one activity is discussed.
+
+=== CRITICAL RULES ===
+1. NEVER invent dates, percentages, or delay counts.
+2. If a value is UNKNOWN, set it to null. Do not guess.
+3. Return ONLY valid JSON. No markdown fences, no extra text outside the JSON.
 4. actual_start_date and actual_end_date must be in YYYY-MM-DD format or null.
+5. Do NOT assume one update is about only one activity if multiple are mentioned.
+6. "almost done", "nearly complete", "almost finished" → status="in_progress", progress_percent=null.
+7. If the update is completely unrelated to any construction activity (e.g., "lunch break"), set matched_source_task_id=null and confidence_score=5.
+
+=== DOMAIN VOCABULARY ===
+Common abbreviations and informal terms (apply contextually, not blindly):
+- ROW / RoW → Right of Way Clearance
+- WPA / WP-A → Well Pad A location
+- WPB / WP-B → Well Pad B location
+- CSB → Compressor Station B
+- NDT → Non-Destructive Testing (weld inspection)
+- hydro test / hydrotest → Hydrostatic Pressure Test
+- excvation / exvacation → Excavation Work (typo)
+- site prep → Site Preparation
+- pipe lay / stringing → Pipeline Laying
+- signed off / sign off → completed status
+
+=== FEW-SHOT EXAMPLES ===
+
+Example 1 — Informal language, completed:
+Update: "guys finished the welding today at well pad A"
+Expected output:
+{
+  "matched_source_task_id": "<welding task ID at Well Pad A>",
+  "progress_percent": 100,
+  "status": "completed",
+  "delay_days": null,
+  "delay_reason": null,
+  "actual_start_date": null,
+  "actual_end_date": null,
+  "extraction_confidence": 80,
+  "match_confidence": 85,
+  "confidence_score": 80,
+  "reasoning": "INFERENCE: 'finished' indicates completed status, 100% assumed. Location 'well pad A' directly matches. Activity 'welding' is an unambiguous match to the Welding task.",
+  "additional_observations": null
+}
+
+Example 2 — Abbreviations + partial progress:
+Update: "ROW clearing 80% done, WPA"
+Expected output:
+{
+  "matched_source_task_id": "<ROW task ID>",
+  "progress_percent": 80,
+  "status": "in_progress",
+  "delay_days": null,
+  "delay_reason": null,
+  "actual_start_date": null,
+  "actual_end_date": null,
+  "extraction_confidence": 85,
+  "match_confidence": 80,
+  "confidence_score": 80,
+  "reasoning": "FACT: 80% explicitly stated. INFERENCE: in_progress from partial completion. ROW → Right of Way Clearance; WPA → Well Pad A location.",
+  "additional_observations": null
+}
+
+Example 3 — Typo, completed:
+Update: "excvation work complet at WPA"
+Expected output:
+{
+  "matched_source_task_id": "<excavation task ID at Well Pad A>",
+  "progress_percent": 100,
+  "status": "completed",
+  "delay_days": null,
+  "delay_reason": null,
+  "actual_start_date": null,
+  "actual_end_date": null,
+  "extraction_confidence": 75,
+  "match_confidence": 82,
+  "confidence_score": 75,
+  "reasoning": "INFERENCE: 'excvation' is a typo for excavation, 'complet' indicates completed. Location WPA → Well Pad A. Matched to Excavation task at that location.",
+  "additional_observations": null
+}
+
+Example 4 — Delay with count:
+Update: "ROW clearing delayed by 2 days due to rain"
+Expected output:
+{
+  "matched_source_task_id": "<ROW task ID>",
+  "progress_percent": null,
+  "status": "delayed",
+  "delay_days": 2,
+  "delay_reason": "rain",
+  "actual_start_date": null,
+  "actual_end_date": null,
+  "extraction_confidence": 90,
+  "match_confidence": 80,
+  "confidence_score": 80,
+  "reasoning": "FACT: 2-day delay explicitly stated. FACT: rain is the stated reason. ROW → Right of Way Clearance. No progress percentage stated.",
+  "additional_observations": null
+}
+
+Example 5 — Unrelated input (no match):
+Update: "lunch break at 1pm"
+Expected output:
+{
+  "matched_source_task_id": null,
+  "progress_percent": null,
+  "status": null,
+  "delay_days": null,
+  "delay_reason": null,
+  "actual_start_date": null,
+  "actual_end_date": null,
+  "extraction_confidence": 5,
+  "match_confidence": 0,
+  "confidence_score": 5,
+  "reasoning": "Update contains no reference to any scheduled construction activity. Cannot be matched.",
+  "additional_observations": null
+}
+
+Example 6 — Multi-activity:
+Update: "pipeline laid + welding done at WPA section 2"
+Expected output:
+{
+  "matched_source_task_id": "<primary task ID — likely Welding at WPA>",
+  "progress_percent": 100,
+  "status": "completed",
+  "delay_days": null,
+  "delay_reason": null,
+  "actual_start_date": null,
+  "actual_end_date": null,
+  "extraction_confidence": 75,
+  "match_confidence": 78,
+  "confidence_score": 75,
+  "reasoning": "INFERENCE: Two activities mentioned. Primary match: Welding (done = completed). Secondary: Pipeline Laying (laid = completed).",
+  "additional_observations": [
+    {
+      "candidate_source_task_id": "<pipeline task ID>",
+      "activity_description": "pipeline laid",
+      "progress_percent": 100,
+      "status": "completed",
+      "extraction_confidence": 70
+    }
+  ]
+}
 """
 
 
@@ -665,6 +1247,13 @@ class GeminiAIProvider(AIProvider):
     Reads GEMINI_API_KEY from the environment.
     Requests structured JSON output from the model.
     Never invents values: unknown fields are left as None.
+
+    Improvements over baseline:
+    - Applies domain alias normalization before building the prompt.
+    - Improved system prompt with few-shot examples, dual confidence schema,
+      multi-activity extraction, and explicit FACT/INFERENCE/UNKNOWN guidance.
+    - Computes composite confidence from LLM + deterministic signals.
+    - Returns matched_task_id = None when composite confidence < 50.0.
     """
 
     def __init__(self, api_key: str | None = None) -> None:
@@ -696,31 +1285,42 @@ class GeminiAIProvider(AIProvider):
         reported_on: str,
         candidate_tasks: list[dict[str, Any]],
     ) -> AnalysisResult:
+        # Apply alias normalization to update text and location before prompt
+        norm_update = normalize_with_aliases(raw_update, _ALL_ALIAS_PAIRS)
+        norm_location = normalize_with_aliases(location, _LOCATION_ALIAS_PAIRS)
+
         # Build the user message
         if candidate_tasks:
             task_lines = "\n".join(
                 f"  - source_task_id={t['source_task_id']}, "
-                f"activity={t['activity']}, "
-                f"location={t['location']}, "
+                f"activity={normalize_with_aliases(t['activity'], _ACTIVITY_ALIAS_PAIRS)}, "
+                f"location={normalize_with_aliases(t.get('location',''), _LOCATION_ALIAS_PAIRS)}, "
                 f"planned_start={t.get('planned_start', '?')}, "
                 f"planned_end={t.get('planned_end', '?')}"
                 for t in candidate_tasks
             )
-            tasks_section = f"PLANNED TASKS AT THIS LOCATION:\n{task_lines}"
+            tasks_section = f"CANDIDATE SCHEDULE TASKS (shortlisted by location/activity/date):\n{task_lines}"
         else:
-            tasks_section = "PLANNED TASKS AT THIS LOCATION: none found"
+            tasks_section = "CANDIDATE SCHEDULE TASKS: none found for this location/update"
 
         user_message = (
             f"SITE UPDATE\n"
-            f"Location: {location}\n"
+            f"Location (reported): {location}\n"
+            f"Location (normalized): {norm_location}\n"
             f"Reported on: {reported_on}\n"
-            f"Update text:\n{raw_update}\n\n"
+            f"Original update text:\n{raw_update}\n"
+            f"Normalized update text:\n{norm_update}\n\n"
             f"{tasks_section}"
         )
 
         # Build source_task_id → id map for resolving the matched task UUID
         task_id_map: dict[str, str] = {
             t["source_task_id"]: t["id"] for t in candidate_tasks
+        }
+        # Deterministic score for composite confidence (use original location, not re-normalized)
+        task_det_scores: dict[str, float] = {
+            t["source_task_id"]: score_candidate_task(t, norm_update, location)
+            for t in candidate_tasks
         }
 
         raw_response_text: str = ""
@@ -735,7 +1335,7 @@ class GeminiAIProvider(AIProvider):
                     system_instruction=_SYSTEM_PROMPT,
                     response_mime_type="application/json",
                     temperature=0.1,   # low temperature → more deterministic output
-                    max_output_tokens=2048,  # raised from 1024; reasoning can be long
+                    max_output_tokens=3000,  # increased for multi-activity + reasoning
                 ),
             )
             raw_response_text = response.text or ""
@@ -761,22 +1361,20 @@ class GeminiAIProvider(AIProvider):
             )
             return _unknown_result(_GEMINI_MODEL, str(exc), raw=raw_response_text)
 
-        # Resolve matched_task_id: model returns source_task_id; we need the DB UUID
+        # --- Step 3: resolve task UUID ---
         matched_source = _safe_str(parsed.get("matched_source_task_id"))
         matched_task_uuid: str | None = None
         if matched_source and matched_source in task_id_map:
             matched_task_uuid = task_id_map[matched_source]
 
-        # Validate status against DB CHECK constraint
+        # --- Step 4: validate extracted fields ---
         raw_status = _safe_str(parsed.get("status"))
         status: str | None = raw_status if raw_status in _ALLOWED_STATUSES else None
 
-        # progress_percent: must be 0-100
         progress = _safe_float(parsed.get("progress_percent"))
         if progress is not None and not (0.0 <= progress <= 100.0):
             progress = None
 
-        # delay_days: must be non-negative int, fallback to text parsing if model missed it
         delay_days = _safe_int(parsed.get("delay_days"))
         if delay_days is None:
             delay_days = _extract_delay_days(raw_update)
@@ -786,21 +1384,54 @@ class GeminiAIProvider(AIProvider):
         if delay_days and delay_days > 0 and status is None:
             status = "delayed"
 
-        # confidence_score: must be 0-100
-        raw_conf = _safe_float(parsed.get("confidence_score"))
-        if raw_conf is not None:
-            confidence = max(0.0, min(100.0, raw_conf))
-        else:
-            _, eval_conf, _ = evaluate_task_matches(
-                candidate_tasks=candidate_tasks,
-                raw_update=raw_update,
-                location=location,
-            )
-            confidence = eval_conf
-
-        # date fields: must match YYYY-MM-DD
         actual_start = _safe_iso_date(parsed.get("actual_start_date"))
         actual_end = _safe_iso_date(parsed.get("actual_end_date"))
+
+        # --- Step 5: compute composite confidence ---
+        llm_confidence = _safe_float(parsed.get("confidence_score")) or 0.0
+        llm_confidence = max(0.0, min(100.0, llm_confidence))
+
+        llm_extraction_conf = _safe_float(parsed.get("extraction_confidence")) or llm_confidence
+        llm_extraction_conf = max(0.0, min(100.0, llm_extraction_conf))
+
+        llm_match_conf = _safe_float(parsed.get("match_confidence")) or llm_confidence
+        llm_match_conf = max(0.0, min(100.0, llm_match_conf))
+
+        # Deterministic score for the matched task (or best available)
+        det_score = 0.0
+        loc_match_score = 0
+        if matched_source:
+            det_score = task_det_scores.get(matched_source, 0.0)
+            if matched_task_uuid:
+                matched_task = next((t for t in candidate_tasks if t["id"] == matched_task_uuid), None)
+                if matched_task:
+                    # Pass raw location (not re-normalized) to avoid double-normalization bug
+                    loc_match_score = _location_match_score(
+                        matched_task.get("location", "").lower(),
+                        location.lower(),        # original, not norm_location
+                        raw_update.lower(),      # original raw text
+                    )
+        elif task_det_scores:
+            # No match from LLM — use deterministic fallback as hint
+            det_score = 0.0
+
+
+        composite = compute_composite_confidence(
+            llm_confidence=llm_match_conf,
+            llm_extraction_confidence=llm_extraction_conf,
+            deterministic_score=det_score,
+            location_match_score=loc_match_score,
+        )
+
+        # Enforce tier: if composite < 50, no confirmed match
+        if composite < 50.0:
+            matched_task_uuid = None
+            matched_source = None
+
+        # --- Step 6: multi-activity additional observations ---
+        additional_obs = parsed.get("additional_observations")
+        if not isinstance(additional_obs, list):
+            additional_obs = None
 
         return AnalysisResult(
             matched_task_id=matched_task_uuid,
@@ -810,12 +1441,18 @@ class GeminiAIProvider(AIProvider):
             delay_reason=_safe_str(parsed.get("delay_reason")),
             actual_start_date=actual_start,
             actual_end_date=actual_end,
-            confidence_score=confidence,
+            confidence_score=composite,
             model_name=_GEMINI_MODEL,
             model_response={
                 "raw_json": parsed,
                 "matched_source_task_id": matched_source,
                 "reasoning": _safe_str(parsed.get("reasoning")),
+                "extraction_confidence": llm_extraction_conf,
+                "match_confidence": llm_match_conf,
+                "composite_confidence": composite,
+                "deterministic_score": det_score,
+                "location_match_score": loc_match_score,
+                "additional_observations": additional_obs,
             },
         )
 
@@ -927,4 +1564,3 @@ def _safe_iso_date(value: Any) -> str | None:
         except ValueError:
             return None
     return None
-

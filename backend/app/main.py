@@ -158,10 +158,19 @@ def create_site_update(
 
 
 @app.get("/site-updates", tags=["site-updates"])
-def list_site_updates(db: Session = Depends(get_db)) -> list[dict]:
+def list_site_updates(
+    status_filter: str = Query(
+        "active",
+        alias="status",
+        description="Filter site updates: 'active' (default), 'historical', or 'all'",
+    ),
+    db: Session = Depends(get_db),
+) -> list[dict]:
     """Return stored site updates, newest reported date first."""
+    raw_status = getattr(status_filter, "default", status_filter)
+    status_str = raw_status if isinstance(raw_status, str) else "active"
     try:
-        return site_updates.list_site_updates(db)
+        return site_updates.list_site_updates(db, status=status_str)
     except SQLAlchemyError as error:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

@@ -75,8 +75,9 @@ export const importScheduleSpreadsheet = importSchedule;
 // Site Updates & Spreadsheet Ingestion APIs
 // ---------------------------------------------------------------------------
 
-export async function getSiteUpdates() {
-  return request('/site-updates');
+export async function getSiteUpdates(status = 'active') {
+  const query = status ? `?status=${encodeURIComponent(status)}` : '';
+  return request(`/site-updates${query}`);
 }
 
 export async function getSiteUpdateResult(updateId) {

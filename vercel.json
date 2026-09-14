@@ -1,0 +1,51 @@
+{
+  "buildCommand": "cd frontend && npm install && npm run build",
+  "outputDirectory": "frontend/dist",
+  "rewrites": [
+    {
+      "source": "/schedule/(.*)",
+      "destination": "/api/index.py"
+    },
+    {
+      "source": "/schedule",
+      "destination": "/api/index.py"
+    },
+    {
+      "source": "/site-updates/(.*)",
+      "destination": "/api/index.py"
+    },
+    {
+      "source": "/site-updates",
+      "destination": "/api/index.py"
+    },
+    {
+      "source": "/planner/(.*)",
+      "destination": "/api/index.py"
+    },
+    {
+      "source": "/planner",
+      "destination": "/api/index.py"
+    },
+    {
+      "source": "/review/(.*)",
+      "destination": "/api/index.py"
+    },
+    {
+      "source": "/review",
+      "destination": "/api/index.py"
+    },
+    {
+      "source": "/health",
+      "destination": "/api/index.py"
+    },
+    {
+      "source": "/docs",
+      "destination": "/api/index.py"
+    },
+    {
+      "source": "/openapi.json",
+      "destination": "/api/index.py"
+    }
+  ]
+}
+

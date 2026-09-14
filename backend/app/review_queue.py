@@ -67,6 +67,7 @@ _REVIEW_QUEUE_QUERY = text(
         su.location,
         su.raw_update,
         su.source_reference,
+        su.archived_at::TEXT       AS archived_at,
         ap.matched_task_id,
         ap.progress_percent,
         ap.status,
@@ -117,6 +118,7 @@ _FETCH_REVIEW_ITEM_QUERY = text(
         su.location,
         su.raw_update,
         su.source_reference,
+        su.archived_at::TEXT       AS archived_at,
         ap.matched_task_id,
         ap.progress_percent,
         ap.status,
@@ -371,13 +373,14 @@ def get_review_queue(
     for r in rows:
         model_resp = _parse_model_response(r.model_response)
         review_state = model_resp.get("review_status", "pending")
+        is_archived = getattr(r, "archived_at", None) is not None or review_state == "historical"
 
         # Filter by review status
-        if clean_status == "pending" and review_state != "pending":
+        if clean_status == "pending" and (review_state != "pending" or is_archived):
             continue
-        elif clean_status == "resolved" and review_state in ("pending", "historical"):
+        elif clean_status == "resolved" and (review_state in ("pending", "historical") or is_archived):
             continue
-        elif clean_status == "historical" and review_state != "historical":
+        elif clean_status == "historical" and not is_archived:
             continue
 
         conf = float(r.confidence_score) if r.confidence_score is not None else 0.0
@@ -435,6 +438,8 @@ def get_review_queue(
             "location": r.location,
             "raw_update": r.raw_update,
             "source_reference": r.source_reference,
+            "archived_at": getattr(r, "archived_at", None),
+            "is_archived": is_archived,
             "extracted_activity": extracted_act,
             "progress_percent": (
                 float(r.progress_percent) if r.progress_percent is not None else None

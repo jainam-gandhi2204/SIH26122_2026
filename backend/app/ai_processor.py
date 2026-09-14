@@ -3,11 +3,32 @@
 Responsibilities
 ----------------
 1. Fetch the site_update row from the database.
-2. Find candidate schedule_tasks for the same location.
+2. Shortlist candidate schedule_tasks using multi-signal scoring
+   (location, activity keywords, date proximity, alias normalization).
 3. Call the configured AI provider to produce an AnalysisResult.
 4. Mark any existing current ai_processed_updates row as is_current = false.
 5. Insert the new ai_processed_updates row.
-6. Return a formatted dict suitable for the HTTP response.
+6. If confidence >= 80.0 (HIGH tier), auto-link and update schedule_tasks actuals.
+7. Return a formatted dict suitable for the HTTP response.
+
+Candidate Generation
+--------------------
+Rather than sending ALL schedule tasks to the AI provider,
+`shortlist_candidates()` scores each task on multiple deterministic signals:
+- Location match (alias-aware): 0–30 points
+- Activity keyword overlap (alias-normalized): 0–50 points
+- Schedule state compatibility (not already completed): 0–10 points
+- Date plausibility (update date near task window): 0–10 points
+
+The top-N candidates (default 30) are sent to the provider.  The shortlister
+always preserves a minimum set of candidates for recall: if no high-scoring
+tasks exist, the top 5 by planned date are included anyway.
+
+Confidence Tiers
+----------------
+  HIGH  >= 80.0 → auto-link, update schedule actuals
+  MEDIUM 50.0–79.9 → planner review (matched_task_id stored, not auto-updated)
+  LOW   < 50.0 → unmatched review (matched_task_id = None; no false match stored)
 
 This module does NOT import FastAPI; all database errors propagate to the
 caller (main.py) which converts them to HTTP responses.
@@ -17,13 +38,23 @@ from __future__ import annotations
 
 import datetime
 import json
+import re
 import uuid
 from typing import Any
 
 from sqlalchemy import bindparam, Float, Integer, String, text
 from sqlalchemy.orm import Session
 
-from app.ai_provider import AIProvider, AnalysisResult, get_provider
+from app.ai_provider import (
+    AIProvider,
+    AnalysisResult,
+    get_provider,
+    normalize_with_aliases,
+    _ALL_ALIAS_PAIRS,
+    _ACTIVITY_SYNONYMS,
+    _STOP_WORDS,
+    _location_match_score,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -43,7 +74,8 @@ _FETCH_ALL_SCHEDULE_TASKS = text(
     """
     SELECT id, source_task_id, activity, location,
            planned_start::TEXT AS planned_start,
-           planned_end::TEXT   AS planned_end
+           planned_end::TEXT   AS planned_end,
+           COALESCE(status, 'not_started') AS status
     FROM schedule_tasks
     ORDER BY planned_start
     """
@@ -223,6 +255,161 @@ def _format_result(row: Any) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Multi-signal candidate shortlisting
+# ---------------------------------------------------------------------------
+
+_MAX_CANDIDATES = 30    # Maximum candidates sent to AI provider
+_MIN_CANDIDATES = 5     # Minimum candidates always included (recall preservation)
+_DATE_PROXIMITY_DAYS = 60   # Window (days) for date plausibility scoring
+
+
+def _shortlist_score(
+    task: dict[str, Any],
+    raw_update: str,
+    location: str,
+    reported_on_str: str,
+) -> float:
+    """Score a single task for shortlisting using deterministic multi-signal heuristics.
+
+    Signals and weights:
+    - Location match (alias-aware):           0–30 points
+    - Activity keyword overlap (normalized):  0–50 points
+    - Schedule state compatibility:           0–10 points
+    - Date plausibility:                      0–10 points
+
+    Total max: 100 points.
+
+    These are PRIORITY signals, not hard gates.  A task with score 0 may still
+    appear in the candidate list if it's in the top-MIN_CANDIDATES by planned date.
+    """
+    norm_raw = normalize_with_aliases(raw_update, _ALL_ALIAS_PAIRS)
+    norm_loc = normalize_with_aliases(location, _ALL_ALIAS_PAIRS)
+    raw_lower = norm_raw.lower()
+    loc_lower = norm_loc.lower()
+
+    task_loc = str(task.get("location", "")).strip().lower()
+    task_act = normalize_with_aliases(str(task.get("activity", "")), _ALL_ALIAS_PAIRS).strip().lower()
+
+    # 1. Location match score (0–30)
+    loc_signal = _location_match_score(task_loc, loc_lower, raw_update.lower())
+    location_points = loc_signal * 10.0  # 0, 10, 20, 30
+
+    # 2. Activity keyword overlap (0–50)
+    act_words = [w for w in re.findall(r"\w+", task_act) if len(w) > 2]
+    distinctive = [w for w in act_words if w not in _STOP_WORDS] or act_words
+    keyword_points = 0.0
+    if distinctive:
+        matched = 0
+        for tok in distinctive:
+            if re.search(r"\b" + re.escape(tok) + r"\b", raw_lower):
+                matched += 1
+                continue
+            # Check synonyms
+            for root, syns in _ACTIVITY_SYNONYMS.items():
+                if tok.startswith(root) or any(s in tok for s in syns):
+                    if any(re.search(r"\b" + re.escape(s) + r"\b", raw_lower) for s in syns):
+                        matched += 1
+                        break
+        keyword_points = (matched / len(distinctive)) * 50.0
+
+    # 3. Schedule state compatibility (0–10)
+    # Don't penalize hard if status not available — only give bonus for clearly non-completed
+    task_status = str(task.get("status", "") or "").lower()
+    state_points = 10.0 if task_status != "completed" else 2.0
+
+    # 4. Date plausibility (0–10): update reported_on within ±DATE_PROXIMITY_DAYS of task window
+    date_points = 5.0  # default neutral
+    try:
+        rep_date = datetime.date.fromisoformat(str(reported_on_str)[:10])
+        plan_start_str = task.get("planned_start") or ""
+        plan_end_str = task.get("planned_end") or ""
+        if plan_start_str and plan_end_str:
+            plan_start = datetime.date.fromisoformat(str(plan_start_str)[:10])
+            plan_end = datetime.date.fromisoformat(str(plan_end_str)[:10])
+            # Within or near the planned window
+            earliest = plan_start - datetime.timedelta(days=_DATE_PROXIMITY_DAYS)
+            latest = plan_end + datetime.timedelta(days=_DATE_PROXIMITY_DAYS)
+            if earliest <= rep_date <= latest:
+                # More points if update is actually within the task window
+                if plan_start <= rep_date <= plan_end:
+                    date_points = 10.0
+                else:
+                    date_points = 7.0
+            else:
+                date_points = 0.0
+    except (ValueError, TypeError):
+        date_points = 5.0  # can't parse → neutral
+
+    return location_points + keyword_points + state_points + date_points
+
+
+def shortlist_candidates(
+    all_tasks: list[dict[str, Any]],
+    raw_update: str,
+    location: str,
+    reported_on: str,
+    max_candidates: int = _MAX_CANDIDATES,
+    min_candidates: int = _MIN_CANDIDATES,
+) -> list[dict[str, Any]]:
+    """Select the most plausible candidate tasks for a site update.
+
+    Uses multi-signal deterministic scoring to reduce a large schedule to the
+    most relevant candidates before sending to the AI provider.
+
+    Design principles:
+    - Location, activity keywords, date proximity are PRIORITY SIGNALS, not
+      hard gates.  A task with no location match is still a valid candidate
+      if it scores high on activity keywords.
+    - Recall preservation: always includes at least min_candidates tasks so
+      that borderline matches are not discarded.
+    - For small schedules (≤ max_candidates tasks), all tasks are returned.
+
+    Parameters
+    ----------
+    all_tasks:      Full list of schedule tasks from the DB.
+    raw_update:     Raw site update text.
+    location:       Reported location from the site update.
+    reported_on:    ISO date string of the update (YYYY-MM-DD).
+    max_candidates: Maximum number of tasks to return (default 30).
+    min_candidates: Minimum tasks always included (default 5).
+
+    Returns
+    -------
+    Shortlisted list of task dicts, length between min_candidates and max_candidates.
+    """
+    if len(all_tasks) <= max_candidates:
+        # Small schedule: no shortlisting needed; return all
+        return all_tasks
+
+    # Score each task
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for task in all_tasks:
+        score = _shortlist_score(task, raw_update, location, reported_on)
+        scored.append((score, task))
+
+    # Sort by score descending, then by planned_start for tie-breaking
+    scored.sort(key=lambda x: (-x[0], x[1].get("planned_start") or ""))
+
+    top_n = scored[:max_candidates]
+
+    # Always guarantee min_candidates from the full list (recall preservation)
+    # If we already have enough, just return top_n
+    if len(top_n) >= min_candidates:
+        return [t for _, t in top_n]
+
+    # Fill to min_candidates from date-sorted remainder (shouldn't normally happen)
+    included_ids = {t["id"] for _, t in top_n}
+    date_sorted_remainder = sorted(
+        [t for _, t in scored if t["id"] not in included_ids],
+        key=lambda t: (t.get("planned_start") or ""),
+    )
+    for task in date_sorted_remainder[:min_candidates - len(top_n)]:
+        top_n.append((0.0, task))
+
+    return [t for _, t in top_n]
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -261,7 +448,7 @@ def process_site_update(
         raise SiteUpdateNotFoundError(f"Site update '{update_id}' not found")
     update_id = str(update_row.id)
 
-    # 2. Candidate tasks: fetch all schedule tasks and prioritize matching location
+    # 2. Fetch all schedule tasks from DB
     task_rows = db.execute(_FETCH_ALL_SCHEDULE_TASKS).fetchall()
     all_candidates = [
         {
@@ -271,27 +458,25 @@ def process_site_update(
             "location": row.location,
             "planned_start": row.planned_start,
             "planned_end": row.planned_end,
+            "status": getattr(row, "status", "not_started"),
         }
         for row in task_rows
     ]
 
-    loc_clean = (update_row.location or "").strip().lower()
-    raw_lower = (update_row.raw_update or "").lower()
-
-    # Prioritize tasks whose location matches reported location or is mentioned in raw update
-    loc_matched = [
-        t for t in all_candidates
-        if (loc_clean and t.get("location", "").strip().lower() == loc_clean)
-        or (t.get("location", "").strip() and t.get("location", "").strip().lower() in raw_lower)
-    ]
-    candidate_tasks = loc_matched if loc_matched else all_candidates
-
-    # 3. Call provider
+    # 3. Shortlist candidates using multi-signal scoring
     reported_on_str = (
         update_row.reported_on.isoformat()
         if hasattr(update_row.reported_on, "isoformat")
         else str(update_row.reported_on)
     )
+    candidate_tasks = shortlist_candidates(
+        all_tasks=all_candidates,
+        raw_update=update_row.raw_update or "",
+        location=update_row.location or "",
+        reported_on=reported_on_str,
+    )
+
+    # 4. Call provider with shortlisted candidates
     result: AnalysisResult = provider.analyse(
         raw_update=update_row.raw_update,
         location=update_row.location,
@@ -299,10 +484,10 @@ def process_site_update(
         candidate_tasks=candidate_tasks,
     )
 
-    # 4. Expire the previous current record for this site update
+    # 5. Expire the previous current record for this site update
     db.execute(_EXPIRE_CURRENT, {"site_update_id": update_id})
 
-    # 5. Insert new row
+    # 6. Insert new row
     new_id = str(uuid.uuid4())
     inserted_row = db.execute(
         _INSERT_PROCESSED,
@@ -322,13 +507,13 @@ def process_site_update(
         },
     ).fetchone()
 
-    # 6. If matched to a planned task with high confidence (>= 70.0),
-    #    automatically update schedule_tasks actuals.
-    #    Lower-confidence and ambiguous matches are held for planner review.
-    #    (baseline planned dates planned_start/planned_end are NEVER overwritten;
+    # 7. Auto-link: if matched with HIGH confidence (>= 80.0), update schedule_tasks actuals.
+    #    MEDIUM (50–79.9): match stored for planner review, but schedule NOT auto-updated.
+    #    LOW (< 50.0): matched_task_id is None (set by provider); no schedule update.
+    #    (baseline planned_start/planned_end are NEVER overwritten;
     #     existing known values are never overwritten with NULL/UNKNOWN;
     #     older/lower-progress updates do not overwrite newer/higher-progress actuals)
-    if result.matched_task_id and result.confidence_score >= 70.0:
+    if result.matched_task_id and result.confidence_score >= 80.0:
         update_schedule_task_actuals(
             db=db,
             task_id=result.matched_task_id,
@@ -343,6 +528,7 @@ def process_site_update(
 
     db.commit()
     return _format_result(inserted_row)
+
 
 
 def update_schedule_task_actuals(

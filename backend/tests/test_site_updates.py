@@ -32,6 +32,7 @@ def _make_mock_row(
     raw_update: str = "Site preparation completed successfully...",
     ingested_at: datetime.datetime | None = datetime.datetime(2026, 9, 5, 12, 0, 0, tzinfo=datetime.timezone.utc),
     source_reference: str | None = None,
+    archived_at: datetime.datetime | None = None,
 ):
     """Return a mock object whose attributes match a site_updates row."""
     row = MagicMock()
@@ -42,6 +43,7 @@ def _make_mock_row(
     row.raw_update = raw_update
     row.ingested_at = ingested_at
     row.source_reference = source_reference
+    row.archived_at = archived_at
     return row
 
 
@@ -223,6 +225,51 @@ class SiteUpdateDatabaseTests(unittest.TestCase):
         self.assertEqual(result[0]["source_update_id"], "U002")
         self.assertEqual(result[1]["source_update_id"], "U001")
 
+    def test_list_site_updates_active_filters_archived(self):
+        mock_db = MagicMock()
+        row = _make_mock_row(source_update_id="U001", archived_at=None)
+        mock_db.execute.return_value.fetchall.return_value = [row]
+
+        result = list_site_updates(mock_db, status="active")
+        self.assertEqual(len(result), 1)
+        self.assertIsNone(result[0]["archived_at"])
+
+        call_sql = str(mock_db.execute.call_args[0][0])
+        self.assertIn("WHERE archived_at IS NULL", call_sql)
+
+    def test_list_site_updates_historical(self):
+        mock_db = MagicMock()
+        archived_time = datetime.datetime(2026, 9, 8, 10, 0, 0, tzinfo=datetime.timezone.utc)
+        row = _make_mock_row(source_update_id="U001", archived_at=archived_time)
+        mock_db.execute.return_value.fetchall.return_value = [row]
+
+        result = list_site_updates(mock_db, status="historical")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["archived_at"], archived_time.isoformat())
+
+        call_sql = str(mock_db.execute.call_args[0][0])
+        self.assertIn("WHERE archived_at IS NOT NULL", call_sql)
+
+    def test_list_site_updates_all(self):
+        mock_db = MagicMock()
+        mock_db.execute.return_value.fetchall.return_value = []
+
+        result = list_site_updates(mock_db, status="all")
+        self.assertEqual(result, [])
+
+        call_sql = str(mock_db.execute.call_args[0][0])
+        self.assertNotIn("WHERE", call_sql)
+
+    def test_format_site_update_with_and_without_archived_at(self):
+        row_active = _make_mock_row(archived_at=None)
+        formatted_active = format_site_update(row_active)
+        self.assertIsNone(formatted_active["archived_at"])
+
+        archived_time = datetime.datetime(2026, 9, 9, 15, 30, 0, tzinfo=datetime.timezone.utc)
+        row_archived = _make_mock_row(archived_at=archived_time)
+        formatted_archived = format_site_update(row_archived)
+        self.assertEqual(formatted_archived["archived_at"], archived_time.isoformat())
+
 
 class SiteUpdateEndpointTests(unittest.TestCase):
     """Tests for the FastAPI endpoint functions with mock DB."""
@@ -269,6 +316,16 @@ class SiteUpdateEndpointTests(unittest.TestCase):
         response = list_site_updates_endpoint(db=mock_db)
         self.assertEqual(len(response), 1)
         self.assertEqual(response[0]["source_update_id"], "U001")
+
+    def test_list_endpoint_passes_status_filter(self):
+        mock_db = MagicMock()
+        row = _make_mock_row()
+        mock_db.execute.return_value.fetchall.return_value = [row]
+
+        response = list_site_updates_endpoint(status_filter="historical", db=mock_db)
+        self.assertEqual(len(response), 1)
+        call_sql = str(mock_db.execute.call_args[0][0])
+        self.assertIn("WHERE archived_at IS NOT NULL", call_sql)
 
     def test_list_endpoint_database_error_raises_503(self):
         mock_db = MagicMock()

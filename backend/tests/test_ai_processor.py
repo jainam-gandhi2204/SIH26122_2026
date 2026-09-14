@@ -243,6 +243,7 @@ class MockAIProviderTests(unittest.TestCase):
     def test_delay_reason_extracted_when_delayed(self):
         result = self._analyse("Operations delayed due to heavy rainfall.")
         self.assertIsNotNone(result.delay_reason)
+        assert result.delay_reason is not None
         self.assertIn("delay", result.delay_reason.lower())
 
     def test_actual_dates_unknown_when_not_stated(self):
@@ -450,7 +451,7 @@ class ProcessSiteUpdateTests(unittest.TestCase):
         self.assertEqual(result["actual_end_date"], "2026-09-05")
 
     def test_process_automatically_updates_schedule_tasks_actuals(self):
-        """When an update is linked to a task, schedule_tasks is updated with latest actuals."""
+        """When an update is linked to a task with HIGH confidence (>= 80.0), schedule_tasks is updated."""
         update_row = _make_update_row(raw_update="Foundation work is 60% done. 2 days delay.")
         task_row = _make_task_row()
         result_row = _make_result_row()
@@ -465,7 +466,7 @@ class ProcessSiteUpdateTests(unittest.TestCase):
             delay_reason="Rain",
             actual_start_date="2026-09-02",
             actual_end_date=None,
-            confidence_score=75.0,
+            confidence_score=82.0,   # >= 80.0 → auto-link threshold
             model_name="mock-keyword-v1",
             model_response={},
         )
@@ -489,6 +490,7 @@ class ProcessSiteUpdateTests(unittest.TestCase):
         # Planned dates must NEVER be overwritten / in the parameters
         self.assertNotIn("planned_start", params)
         self.assertNotIn("planned_end", params)
+
 
     def test_process_unmatched_task_does_not_update_schedule_tasks(self):
         """When an update does not match any planned task, schedule_tasks is not updated."""
@@ -713,7 +715,10 @@ class GeminiAIProviderTests(unittest.TestCase):
         })
         self.assertEqual(result.status, "completed")
         self.assertEqual(result.progress_percent, 100.0)
-        self.assertEqual(result.confidence_score, 85.0)
+        # Composite confidence (LLM + deterministic + extraction + location) will be
+        # higher than 80 for a clear match — not necessarily the raw LLM score of 85.
+        self.assertGreaterEqual(result.confidence_score, 80.0)
+        self.assertLessEqual(result.confidence_score, 100.0)
         self.assertEqual(result.matched_task_id, SAMPLE_TASK_ID)
 
     def test_task_id_resolved_from_source_task_id(self):
@@ -868,7 +873,7 @@ class GeminiAIProviderTests(unittest.TestCase):
         self.assertIsNone(result.actual_end_date)
 
     def test_confidence_clamped_to_100(self):
-        """Confidence scores above 100 are clamped to 100."""
+        """Confidence scores above 100 are clamped so result never exceeds 100.0."""
         result = self._call_with_response({
             "matched_source_task_id": None,
             "status": None,
@@ -880,7 +885,12 @@ class GeminiAIProviderTests(unittest.TestCase):
             "confidence_score": 999,    # out of range
             "reasoning": "Test.",
         })
-        self.assertEqual(result.confidence_score, 100.0)
+        # The composite formula clamps LLM confidence to 100 internally.
+        # With no match, deterministic/location scores are 0, so composite < 100.
+        # The key invariant: result must never be > 100 and never be 999.
+        self.assertLessEqual(result.confidence_score, 100.0)
+        self.assertNotEqual(result.confidence_score, 999)
+        self.assertGreater(result.confidence_score, 0.0)
 
     def test_no_tasks_matched_task_id_is_none(self):
         result = self._call_with_response({
@@ -1135,7 +1145,9 @@ class GeminiParseRobustnessTests(unittest.TestCase):
         self.assertEqual(result.status, "completed")
         self.assertEqual(result.progress_percent, 100.0)
         self.assertEqual(result.matched_task_id, SAMPLE_TASK_ID)
-        self.assertGreater(result.confidence_score, 0)
+        self.assertGreaterEqual(result.confidence_score, 80.0)
+        self.assertLessEqual(result.confidence_score, 100.0)
+
 
     def test_fenced_json_no_language_tag_parsed(self):
         """Model uses ``` without json tag — must still be handled."""
@@ -1153,7 +1165,10 @@ class GeminiParseRobustnessTests(unittest.TestCase):
             candidate_tasks=[],
         )
         self.assertEqual(result.status, "in_progress")
-        self.assertEqual(result.confidence_score, 60.0)
+        # Composite confidence with no candidates and no deterministic match will be
+        # lower than raw LLM score of 60 — the key invariant is it's within [0, 100].
+        self.assertGreater(result.confidence_score, 0.0)
+        self.assertLessEqual(result.confidence_score, 100.0)
 
     def test_truncated_json_returns_unknown_result(self):
         """The exact U002 failure: truncated JSON → parse error → zero-confidence fallback,
@@ -1273,7 +1288,7 @@ class TaskActualsAccumulationTests(unittest.TestCase):
             delay_reason="Rain",
             actual_start_date=None,  # UNKNOWN in this update
             actual_end_date=None,    # UNKNOWN in this update
-            confidence_score=75.0,
+            confidence_score=82.0,   # >= 80.0 → schedule update triggered
             model_name="mock-keyword-v1",
             model_response={},
         )
@@ -1293,6 +1308,7 @@ class TaskActualsAccumulationTests(unittest.TestCase):
         # Baseline planned dates are NEVER in the update params
         self.assertNotIn("planned_start", params)
         self.assertNotIn("planned_end", params)
+
 
     def test_completion_update_sets_end_date_and_preserves_start_date(self):
         """When completion date is reported, actual_end_date is set while start date is retained."""
@@ -1471,6 +1487,9 @@ class TaskActualsAccumulationTests(unittest.TestCase):
         current_status = "completed"
         incoming_status = "in_progress"
         status_after = "completed" if current_status == "completed" else incoming_status
+        self.assertEqual(status_after, "completed")
+
+
 class RegressionScenario1MatchingTests(unittest.TestCase):
     """Specific regression tests for Scenario 1:
     Schedule:
@@ -1481,7 +1500,7 @@ class RegressionScenario1MatchingTests(unittest.TestCase):
     All at 'Test Site'.
     Update: 'Excavation work at Test Site is approximately 60% complete. Heavy rainfall caused a two-day delay.'
     Expected:
-    - P102 is identified with high confidence (>= 75%)
+    - P102 is identified with high confidence (>= 80%)
     - Auto-linked and updated (progress=60%, status='delayed', delay_days=2, delay_reason extracted)
     - Not left as pending review
     """
@@ -1530,7 +1549,7 @@ class RegressionScenario1MatchingTests(unittest.TestCase):
         self.raw_update = "Excavation work at Test Site is approximately 60% complete. Heavy rainfall caused a two-day delay."
 
     def test_p102_matched_with_high_confidence_and_extracted_facts(self):
-        """P102 Excavation Work is matched with high confidence (>= 75%), 60% progress, 2-day delay, delayed status."""
+        """P102 Excavation Work is matched with high confidence (>= 80%), 60% progress, 2-day delay, delayed status."""
         result = self.provider.analyse(
             raw_update=self.raw_update,
             location="Test Site",
@@ -1539,13 +1558,14 @@ class RegressionScenario1MatchingTests(unittest.TestCase):
         )
 
         self.assertEqual(result.matched_task_id, self.p102_id)
-        self.assertGreaterEqual(result.confidence_score, 75.0)
+        self.assertGreaterEqual(result.confidence_score, 80.0)
         self.assertEqual(result.progress_percent, 60.0)
         self.assertEqual(result.status, "delayed")
         self.assertEqual(result.delay_days, 2)
-        delay_reason_lower = (result.delay_reason or "").lower()
+        self.assertIsNotNone(result.delay_reason)
+        assert result.delay_reason is not None
         self.assertTrue(
-            "rainfall" in delay_reason_lower or "rain" in delay_reason_lower or "delay" in delay_reason_lower
+            "rainfall" in result.delay_reason.lower() or "rain" in result.delay_reason.lower() or "delay" in result.delay_reason.lower()
         )
         self.assertEqual(result.model_response.get("confidence_tier"), "high")
 
@@ -1558,7 +1578,7 @@ class RegressionScenario1MatchingTests(unittest.TestCase):
             candidate_tasks=self.candidate_tasks,
         )
         self.assertEqual(result.matched_task_id, self.p102_id)
-        self.assertGreaterEqual(result.confidence_score, 75.0)
+        self.assertGreaterEqual(result.confidence_score, 80.0)
 
     def test_process_site_update_auto_links_and_updates_actuals(self):
         """High confidence match triggers update_schedule_task_actuals in process_site_update."""
@@ -1594,6 +1614,7 @@ class RegressionScenario1MatchingTests(unittest.TestCase):
                 location=t["location"],
                 planned_start=t["planned_start"],
                 planned_end=t["planned_end"],
+                status="not_started",
             )
             for t in self.candidate_tasks
         ]
@@ -1609,11 +1630,12 @@ class RegressionScenario1MatchingTests(unittest.TestCase):
                 mock_res.fetchone.return_value = inserted_mock
             return mock_res
 
-        db.execute.side_effect = db_execute
+        db_execute_mock = db_execute
+        db.execute.side_effect = db_execute_mock
 
         res = process_site_update(db, str(update_row.id), provider=self.provider)
         self.assertEqual(res["matched_task_id"], self.p102_id)
-        self.assertGreaterEqual(res["confidence_score"], 70.0)
+        self.assertGreaterEqual(res["confidence_score"], 80.0)
 
         # Check that UPDATE schedule_tasks actuals was executed
         executed_sqls = [str(call_args[0][0]) for call_args in db.execute.call_args_list]
@@ -1621,7 +1643,165 @@ class RegressionScenario1MatchingTests(unittest.TestCase):
         self.assertEqual(len(update_task_calls), 1)
 
 
+
+# ---------------------------------------------------------------------------
+# Realistic Matching Regression Tests
+# ---------------------------------------------------------------------------
+
+class RealisticMatchingTests(unittest.TestCase):
+    """Regression tests for the 8 messy real-world inputs from the approved
+    implementation plan.  Uses MockAIProvider with a representative schedule.
+
+    Tests verify routing (auto-link / planner-review / unmatched) and basic
+    extraction accuracy.  Exact confidence values are NOT asserted — only
+    tier and directional correctness.
+    """
+
+    REPORTED_ON = "2026-09-10"
+
+    TASKS = [
+        {"id": "t1", "source_task_id": "P101", "activity": "Right of Way Clearance",  "location": "Well Pad A",           "planned_start": "2026-08-01", "planned_end": "2026-08-20"},
+        {"id": "t2", "source_task_id": "P102", "activity": "Excavation Work",          "location": "Well Pad A",           "planned_start": "2026-08-21", "planned_end": "2026-09-10"},
+        {"id": "t3", "source_task_id": "P103", "activity": "Pipeline Laying",          "location": "Well Pad A",           "planned_start": "2026-09-11", "planned_end": "2026-09-30"},
+        {"id": "t4", "source_task_id": "P104", "activity": "Welding",                 "location": "Well Pad A",           "planned_start": "2026-09-15", "planned_end": "2026-10-05"},
+        {"id": "t5", "source_task_id": "P105", "activity": "Site Preparation",        "location": "Compressor Station B", "planned_start": "2026-08-15", "planned_end": "2026-09-05"},
+        {"id": "t6", "source_task_id": "P106", "activity": "Foundation Construction", "location": "Compressor Station B", "planned_start": "2026-09-06", "planned_end": "2026-09-20"},
+    ]
+
+    def setUp(self):
+        self.provider = MockAIProvider()
+
+    def _analyse(self, text: str, location: str = "Well Pad A") -> AnalysisResult:
+        return self.provider.analyse(
+            raw_update=text,
+            location=location,
+            reported_on=self.REPORTED_ON,
+            candidate_tasks=self.TASKS,
+        )
+
+    def test_welding_informal_matches_p104(self):
+        """'guys finished the welding today at well pad A' → P104 Welding, high confidence."""
+        r = self._analyse("guys finished the welding today at well pad A")
+        self.assertEqual(r.matched_task_id, "t4")
+        self.assertGreaterEqual(r.confidence_score, 80.0)
+        self.assertEqual(r.model_response.get("confidence_tier"), "high")
+        self.assertEqual(r.status, "completed")
+        self.assertEqual(r.progress_percent, 100.0)
+
+    def test_row_abbreviation_matches_p101(self):
+        """'ROW clearing 80% done, WPA' → P101 Right of Way, high confidence with alias."""
+        r = self._analyse("ROW clearing 80% done, WPA")
+        self.assertEqual(r.matched_task_id, "t1")
+        self.assertGreaterEqual(r.confidence_score, 80.0)
+        self.assertEqual(r.progress_percent, 80.0)
+        self.assertEqual(r.status, "in_progress")
+
+    def test_typo_excavation_matches_p102(self):
+        """'excvation work complet at WPA' → P102 Excavation (alias + typo fix)."""
+        r = self._analyse("excvation work complet at WPA")
+        self.assertEqual(r.matched_task_id, "t2")
+        self.assertGreaterEqual(r.confidence_score, 80.0)
+        self.assertEqual(r.model_response.get("confidence_tier"), "high")
+        self.assertEqual(r.status, "completed")
+        self.assertEqual(r.progress_percent, 100.0)
+
+    def test_multi_activity_ambiguous_routes_to_review(self):
+        """'pipeline laid + welding done at WPA section 2' → matched but not auto-linked (medium tier)."""
+        r = self._analyse("pipeline laid + welding done at WPA section 2")
+        self.assertEqual(r.model_response.get("confidence_tier"), "medium")
+        self.assertIn(r.matched_task_id, ("t3", "t4"))
+        add_obs = r.model_response.get("additional_observations") or []
+        self.assertGreaterEqual(len(add_obs), 1)
+
+    def test_irrelevant_update_gives_no_match(self):
+        """'lunch break at 1pm' → no match (not a construction activity)."""
+        r = self._analyse("lunch break at 1pm", location="")
+        self.assertIsNone(r.matched_task_id)
+        self.assertLess(r.confidence_score, 50.0)
+
+    def test_row_delay_matched_with_delay_extracted(self):
+        """'ROW clearing delayed by 2 days due to rain' → P101, delay=2 extracted."""
+        r = self._analyse("ROW clearing delayed by 2 days due to rain")
+        self.assertEqual(r.matched_task_id, "t1")
+        self.assertGreaterEqual(r.confidence_score, 80.0)
+        self.assertEqual(r.delay_days, 2)
+        self.assertEqual(r.status, "delayed")
+
+    def test_hinglish_excavation_matched(self):
+        """'aaj excavation almost complete hai, kal bedding start karenge' → P102 in_progress with no hallucinated %."""
+        r = self._analyse("aaj excavation almost complete hai, kal bedding start karenge")
+        self.assertEqual(r.matched_task_id, "t2")
+        self.assertGreaterEqual(r.confidence_score, 80.0)
+        self.assertEqual(r.status, "in_progress")
+        self.assertIsNone(r.progress_percent)
+
+    def test_alias_normalization_row_in_raw_text(self):
+        """Verify ROW → Right of Way Clearance alias is active in matching pipeline."""
+        r = self._analyse("ROW is 90% complete", location="Well Pad A")
+        self.assertEqual(r.matched_task_id, "t1")
+        self.assertGreaterEqual(r.confidence_score, 80.0)
+        self.assertEqual(r.progress_percent, 90.0)
+
+    def test_multi_sentence_progress_report(self):
+        """Multi-sentence field report: narrative surrounding extraction facts."""
+        text = (
+            "Crews arrived at Well Pad A at 7:00 AM. Excavation work proceeded steadily "
+            "throughout the morning shift. As of 3 PM, excavation is 60% complete with no safety incidents."
+        )
+        r = self._analyse(text, location="Well Pad A")
+        self.assertEqual(r.matched_task_id, "t2")
+        self.assertGreaterEqual(r.confidence_score, 80.0)
+        self.assertEqual(r.status, "in_progress")
+        self.assertEqual(r.progress_percent, 60.0)
+
+    def test_location_alias_in_reported_metadata(self):
+        """Update metadata uses location abbreviation 'WPA' matching canonical 'Well Pad A' task."""
+        r = self._analyse("Welding finished for the day.", location="WPA")
+        self.assertEqual(r.matched_task_id, "t4")
+        self.assertGreaterEqual(r.confidence_score, 80.0)
+        self.assertEqual(r.status, "completed")
+        self.assertEqual(r.progress_percent, 100.0)
+
+    def test_vague_progress_does_not_hallucinate_percentage(self):
+        """'nearly complete' sets status in_progress and does NOT invent a percentage number."""
+        r = self._analyse("Right of way clearing is nearly complete at Well Pad A.", location="Well Pad A")
+        self.assertEqual(r.matched_task_id, "t1")
+        self.assertGreaterEqual(r.confidence_score, 80.0)
+        self.assertEqual(r.status, "in_progress")
+        self.assertIsNone(r.progress_percent)
+
+    def test_explicit_completion_infers_100_percent(self):
+        """Explicit completion statement without percentage infers 100% progress."""
+        r = self._analyse("Pipeline laying completed today at Well Pad A.", location="Well Pad A")
+        self.assertEqual(r.matched_task_id, "t3")
+        self.assertGreaterEqual(r.confidence_score, 80.0)
+        self.assertEqual(r.status, "completed")
+        self.assertEqual(r.progress_percent, 100.0)
+
+    def test_explicit_actual_start_date_extracted(self):
+        """Explicit start date is parsed into actual_start_date."""
+        r = self._analyse("Welding started on 2026-09-02 at Well Pad A.", location="Well Pad A")
+        self.assertEqual(r.matched_task_id, "t4")
+        self.assertGreaterEqual(r.confidence_score, 80.0)
+        self.assertEqual(r.actual_start_date, "2026-09-02")
+        self.assertEqual(r.status, "in_progress")
+
+    def test_unrelated_activity_routes_to_unmatched(self):
+        """Unrelated non-construction activity with no matching schedule task yields low confidence and no match."""
+        r = self._analyse("Catering crew set up the dining tent.", location="")
+        self.assertIsNone(r.matched_task_id)
+        self.assertLess(r.confidence_score, 50.0)
+
+    def test_multi_activity_three_tasks_detection(self):
+        """Update mentions excavation, bedding, and pipe stringing: routes to planner review with additional observations."""
+        text = "excavation is complete, bedding is 80 percent and pipe stringing has started"
+        r = self._analyse(text, location="Well Pad A")
+        self.assertEqual(r.model_response.get("confidence_tier"), "medium")
+        self.assertEqual(r.matched_task_id, "t2")
+        add_obs = r.model_response.get("additional_observations") or []
+        self.assertGreaterEqual(len(add_obs), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
-
 

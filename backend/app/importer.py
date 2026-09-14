@@ -9,6 +9,7 @@ import csv
 import datetime
 import io
 import json
+import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -80,6 +81,41 @@ def _strip_row(row: dict[str, Any]) -> dict[str, str]:
     has more columns than the header.  We skip those safely here.
     """
     return {k.strip(): (v.strip() if v else "") for k, v in row.items() if k is not None}
+
+
+def parse_dependencies(raw_dep: str | None) -> list[str]:
+    """Parse the CSV Dependency cell into a list of upstream task IDs.
+
+    Supported formats:
+    - Empty, None, or whitespace-only -> [] (no dependency)
+    - "-" or whitespace around "-" -> [] (no dependency)
+    - Single ID: "CSB105" -> ["CSB105"]
+    - Comma-separated: "CSB114, CSB115" or "CSB114,CSB115" -> ["CSB114", "CSB115"]
+    - Semicolon-separated: "CSB114;CSB115" or "CSB114; CSB115" -> ["CSB114", "CSB115"]
+    - Mixed delimiters: "CSB110, CSB111; CSB112" -> ["CSB110", "CSB111", "CSB112"]
+
+    Normalizes whitespace around IDs. Omits empty tokens and embedded "-".
+    Deduplicates within the same cell while preserving order.
+    """
+    if not raw_dep:
+        return []
+    stripped = raw_dep.strip()
+    if not stripped or stripped == NO_DEPENDENCY:
+        return []
+
+    tokens = re.split(r"[,;]+", stripped)
+    dep_list: list[str] = []
+    seen: set[str] = set()
+
+    for token in tokens:
+        clean = token.strip()
+        if not clean or clean == NO_DEPENDENCY:
+            continue
+        if clean not in seen:
+            seen.add(clean)
+            dep_list.append(clean)
+
+    return dep_list
 
 
 # ---------------------------------------------------------------------------
@@ -154,12 +190,8 @@ def parse_and_validate(content: bytes, filename: str) -> tuple[list[ParsedRow], 
             ))
             continue
 
-        # Parse dependency field: split on comma, strip, drop "-" and blanks
-        raw_dep = row.get("Dependency", "").strip()
-        if not raw_dep or raw_dep == NO_DEPENDENCY:
-            dep_list: list[str] = []
-        else:
-            dep_list = [d.strip() for d in raw_dep.split(",") if d.strip() and d.strip() != NO_DEPENDENCY]
+        # Parse dependency field: supports single ID, comma/semicolon separated multiple IDs, '-' or empty for none
+        dep_list = parse_dependencies(row.get("Dependency", ""))
 
         rows.append(ParsedRow(
             source_task_id=task_id,
@@ -239,6 +271,21 @@ def import_to_db(
 
     if replace:
         db.execute(text("DELETE FROM task_dependencies"))
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        now_iso = now_utc.isoformat()
+
+        # Archive active site updates belonging to the previous schedule baseline
+        db.execute(
+            text(
+                """
+                UPDATE site_updates
+                SET archived_at = :archived_at
+                WHERE archived_at IS NULL
+                """
+            ),
+            {"archived_at": now_utc},
+        )
+
         # Archive pending review items and preserve historical audit trail
         current_ai_rows = db.execute(
             text(
@@ -250,7 +297,6 @@ def import_to_db(
             )
         ).fetchall()
 
-        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
         for ai_row in current_ai_rows:
             row_id = str(ai_row.id)
             raw_resp = ai_row.model_response

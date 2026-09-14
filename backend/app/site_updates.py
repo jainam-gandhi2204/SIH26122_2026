@@ -68,6 +68,14 @@ def format_site_update(row: Any) -> dict[str, Any]:
     else:
         ingested_at_str = None
 
+    archived_at_val = getattr(row, "archived_at", None)
+    if archived_at_val is not None and hasattr(archived_at_val, "isoformat"):
+        archived_at_str = archived_at_val.isoformat()
+    elif archived_at_val is not None:
+        archived_at_str = str(archived_at_val)
+    else:
+        archived_at_str = None
+
     return {
         "id": str(row.id),
         "source_update_id": row.source_update_id,
@@ -76,6 +84,7 @@ def format_site_update(row: Any) -> dict[str, Any]:
         "raw_update": row.raw_update,
         "ingested_at": ingested_at_str,
         "source_reference": getattr(row, "source_reference", None),
+        "archived_at": archived_at_str,
     }
 
 
@@ -95,13 +104,31 @@ _INSERT_SITE_UPDATE_QUERY = text(
         :raw_update,
         :source_reference
     )
-    RETURNING id, source_update_id, reported_on, location, raw_update, ingested_at, source_reference
+    RETURNING id, source_update_id, reported_on, location, raw_update, ingested_at, source_reference, archived_at
     """
 )
 
 _SELECT_SITE_UPDATES_QUERY = text(
     """
-    SELECT id, source_update_id, reported_on, location, raw_update, ingested_at, source_reference
+    SELECT id, source_update_id, reported_on, location, raw_update, ingested_at, source_reference, archived_at
+    FROM site_updates
+    WHERE archived_at IS NULL
+    ORDER BY reported_on DESC, ingested_at DESC
+    """
+)
+
+_SELECT_HISTORICAL_SITE_UPDATES_QUERY = text(
+    """
+    SELECT id, source_update_id, reported_on, location, raw_update, ingested_at, source_reference, archived_at
+    FROM site_updates
+    WHERE archived_at IS NOT NULL
+    ORDER BY reported_on DESC, ingested_at DESC
+    """
+)
+
+_SELECT_ALL_SITE_UPDATES_QUERY = text(
+    """
+    SELECT id, source_update_id, reported_on, location, raw_update, ingested_at, source_reference, archived_at
     FROM site_updates
     ORDER BY reported_on DESC, ingested_at DESC
     """
@@ -125,7 +152,22 @@ def create_site_update(db: Session, payload: SiteUpdateCreate) -> dict[str, Any]
     return format_site_update(row)
 
 
-def list_site_updates(db: Session) -> list[dict[str, Any]]:
-    """Return all stored site updates, ordered with newest reported date first."""
-    rows = db.execute(_SELECT_SITE_UPDATES_QUERY).fetchall()
+def list_site_updates(db: Session, status: str = "active") -> list[dict[str, Any]]:
+    """Return stored site updates, ordered with newest reported date first.
+
+    status: 'active' (default, where archived_at is NULL),
+            'historical' (where archived_at is NOT NULL),
+            or 'all' (all site updates).
+    """
+    if not isinstance(status, str):
+        status = str(getattr(status, "default", "active"))
+    clean_status = (status or "active").strip().lower()
+    if clean_status == "historical":
+        query = _SELECT_HISTORICAL_SITE_UPDATES_QUERY
+    elif clean_status == "all":
+        query = _SELECT_ALL_SITE_UPDATES_QUERY
+    else:
+        query = _SELECT_SITE_UPDATES_QUERY
+
+    rows = db.execute(query).fetchall()
     return [format_site_update(row) for row in rows]
