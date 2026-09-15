@@ -40,7 +40,7 @@ export default function MetricCardsGrid({
   const actualPct = Math.round(overallProgress.actual ?? 0);
   const plannedPct = Math.round(overallProgress.planned ?? 0);
   const variancePct = actualPct - plannedPct;
-  const isCritical = Boolean(criticalDeviation) || statusCounts.delayed > 0;
+  const isCritical = Boolean(criticalDeviation && criticalDeviation.slipDays > 0) || statusCounts.delayed > 0;
   const hasTasks = statusCounts.total > 0;
 
   // Donut SVG circumference calculation for 36x36 (radius = 15.9155 -> perimeter = 100)
@@ -165,8 +165,6 @@ export default function MetricCardsGrid({
             <span className={`text-[13px] font-bold ${isCritical ? 'text-red-600' : 'text-emerald-700'}`}>
               {criticalDeviation && criticalDeviation.slipDays > 0
                 ? `(-${criticalDeviation.slipDays} Day Slip)`
-                : isCritical
-                ? '(-1 Day Slip)'
                 : '(Aligned)'}
             </span>
           </div>

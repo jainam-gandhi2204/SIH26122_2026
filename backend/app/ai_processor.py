@@ -99,6 +99,7 @@ _UPDATE_TASK_ACTUALS = text(
             ELSE last_reported_on
         END,
         progress_percent = CASE
+            WHEN :status = 'completed' THEN 100.0
             WHEN :progress_percent IS NULL THEN progress_percent
             WHEN progress_percent IS NULL THEN :progress_percent
             WHEN :progress_percent > progress_percent THEN :progress_percent
@@ -106,11 +107,13 @@ _UPDATE_TASK_ACTUALS = text(
         END,
         status = CASE
             WHEN status = 'completed' THEN 'completed'
+            WHEN :status = 'completed' OR :progress_percent >= 100.0 THEN 'completed'
             WHEN last_reported_on IS NOT NULL AND CAST(:reported_on AS DATE) < last_reported_on AND status IS NOT NULL THEN status
             ELSE COALESCE(:status, status)
         END,
         delay_days = CASE
             WHEN last_reported_on IS NOT NULL AND CAST(:reported_on AS DATE) < last_reported_on AND delay_days IS NOT NULL THEN delay_days
+            WHEN (:status = 'completed' OR :progress_percent >= 100.0) AND :delay_days IS NULL THEN COALESCE(delay_days, 0)
             ELSE COALESCE(:delay_days, delay_days)
         END,
         delay_reason = CASE
@@ -126,6 +129,8 @@ _UPDATE_TASK_ACTUALS = text(
         actual_end_date = CASE
             WHEN actual_end_date IS NOT NULL THEN actual_end_date
             WHEN last_reported_on IS NOT NULL AND CAST(:reported_on AS DATE) < last_reported_on THEN actual_end_date
+            WHEN CAST(:actual_end_date AS DATE) IS NOT NULL THEN CAST(:actual_end_date AS DATE)
+            WHEN (:status = 'completed' OR :progress_percent >= 100.0) THEN CAST(:reported_on AS DATE)
             ELSE COALESCE(CAST(:actual_end_date AS DATE), actual_end_date)
         END,
         updated_at = now()
@@ -514,16 +519,29 @@ def process_site_update(
     #     existing known values are never overwritten with NULL/UNKNOWN;
     #     older/lower-progress updates do not overwrite newer/higher-progress actuals)
     if result.matched_task_id and result.confidence_score >= 80.0:
+        eff_status = result.status
+        eff_progress = result.progress_percent
+        eff_end = result.actual_end_date
+        eff_delay = result.delay_days
+
+        if eff_status == "completed" or (eff_progress is not None and eff_progress >= 100.0):
+            eff_status = "completed"
+            eff_progress = 100.0
+            if eff_end is None:
+                eff_end = reported_on_str
+            if eff_delay is None:
+                eff_delay = 0
+
         update_schedule_task_actuals(
             db=db,
             task_id=result.matched_task_id,
             reported_on=reported_on_str,
-            progress_percent=result.progress_percent,
-            status=result.status,
-            delay_days=result.delay_days,
+            progress_percent=eff_progress,
+            status=eff_status,
+            delay_days=eff_delay,
             delay_reason=result.delay_reason,
             actual_start_date=result.actual_start_date,
-            actual_end_date=result.actual_end_date,
+            actual_end_date=eff_end,
         )
 
     db.commit()

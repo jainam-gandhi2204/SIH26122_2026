@@ -49,7 +49,9 @@ export default function CriticalAlertBanner({
     );
   }
 
-  if (!criticalDeviation && atRiskCount === 0) {
+  const slipDays = criticalDeviation?.slipDays ?? 0;
+
+  if ((!criticalDeviation || slipDays <= 0) && atRiskCount === 0) {
     return (
       <section className="bg-emerald-50/70 border border-emerald-200/90 rounded-xl p-3.5 flex items-center justify-between shadow-xs">
         <div className="flex items-center gap-3">
@@ -73,7 +75,6 @@ export default function CriticalAlertBanner({
 
   const taskId = criticalDeviation?.task_id || 'Schedule Task';
   const taskName = criticalDeviation?.task_name || '';
-  const slipDays = criticalDeviation?.slipDays || 1;
   const progressPercent = criticalDeviation?.progress_percent;
   const reason = criticalDeviation?.reason;
 

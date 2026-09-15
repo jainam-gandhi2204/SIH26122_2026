@@ -649,5 +649,350 @@ class GetTaskUnitTests(unittest.TestCase):
         self.assertIsNone(task)
 
 
+# ---------------------------------------------------------------------------
+# CPM Schedule Engine Scenarios Tests (Scenarios A through F)
+# ---------------------------------------------------------------------------
+
+CP101_UUID = "cccccccc-0000-0000-0000-000000000101"
+CP102_UUID = "cccccccc-0000-0000-0000-000000000102"
+CP103_UUID = "cccccccc-0000-0000-0000-000000000103"
+CP104_UUID = "cccccccc-0000-0000-0000-000000000104"
+CP105_UUID = "cccccccc-0000-0000-0000-000000000105"
+CP106_UUID = "cccccccc-0000-0000-0000-000000000106"
+CP107_UUID = "cccccccc-0000-0000-0000-000000000107"
+CP108_UUID = "cccccccc-0000-0000-0000-000000000108"
+CP109_UUID = "cccccccc-0000-0000-0000-000000000109"
+CP110_UUID = "cccccccc-0000-0000-0000-000000000110"
+CP111_UUID = "cccccccc-0000-0000-0000-000000000111"
+CP112_UUID = "cccccccc-0000-0000-0000-000000000112"
+CP113_UUID = "cccccccc-0000-0000-0000-000000000113"
+CP114_UUID = "cccccccc-0000-0000-0000-000000000114"
+CP115_UUID = "cccccccc-0000-0000-0000-000000000115"
+CP116_UUID = "cccccccc-0000-0000-0000-000000000116"
+CP117_UUID = "cccccccc-0000-0000-0000-000000000117"
+
+# Real baseline schedule data for CP101..CP117 from test_schedule.csv
+CP_SCHEDULE_DEF = [
+    ("CP101", CP101_UUID, "Site Survey and Route Marking", "2026-09-15", "2026-09-17", []),
+    ("CP102", CP102_UUID, "Right of Way Clearance", "2026-09-18", "2026-09-21", [CP101_UUID]),
+    ("CP103", CP103_UUID, "Trench Excavation", "2026-09-22", "2026-09-27", [CP102_UUID]),
+    ("CP104", CP104_UUID, "Trench Dewatering", "2026-09-25", "2026-09-28", [CP103_UUID]),
+    ("CP105", CP105_UUID, "Sand Bedding", "2026-09-29", "2026-09-30", [CP103_UUID, CP104_UUID]),
+    ("CP106", CP106_UUID, "Pipe Stringing", "2026-09-29", "2026-10-03", [CP103_UUID]),
+    ("CP107", CP107_UUID, "Pipeline Welding", "2026-10-04", "2026-10-08", [CP105_UUID, CP106_UUID]),
+    ("CP108", CP108_UUID, "Weld Inspection and NDT", "2026-10-09", "2026-10-10", [CP107_UUID]),
+    ("CP109", CP109_UUID, "Pipeline Lowering", "2026-10-11", "2026-10-13", [CP108_UUID, CP104_UUID]),
+    ("CP110", CP110_UUID, "Backfilling", "2026-10-14", "2026-10-17", [CP109_UUID]),
+    ("CP111", CP111_UUID, "Valve Chamber Construction", "2026-10-05", "2026-10-12", [CP102_UUID]),
+    ("CP112", CP112_UUID, "Valve Installation", "2026-10-13", "2026-10-15", [CP111_UUID, CP108_UUID]),
+    ("CP113", CP113_UUID, "Cathodic Protection Installation", "2026-10-16", "2026-10-18", [CP110_UUID, CP112_UUID]),
+    ("CP114", CP114_UUID, "Hydrostatic Pressure Testing", "2026-10-19", "2026-10-21", [CP110_UUID, CP113_UUID]),
+    ("CP115", CP115_UUID, "Reinstatement and Site Restoration", "2026-10-22", "2026-10-24", [CP114_UUID]),
+    ("CP116", CP116_UUID, "Final Inspection", "2026-10-25", "2026-10-26", [CP114_UUID, CP115_UUID]),
+    ("CP117", CP117_UUID, "Commissioning and Handover", "2026-10-27", "2026-10-29", [CP116_UUID]),
+]
+
+
+def _build_cp_dataset(cp101_actuals=None):
+    """Build mock DB for all 17 CP tasks with CP101 having specified actuals."""
+    all_tasks = []
+    dep_rows = []
+
+    for sid, uid, activity, pstart, pend, up_uids in CP_SCHEDULE_DEF:
+        if sid == "CP101" and cp101_actuals:
+            row = _row(
+                task_id=uid,
+                source_task_id=sid,
+                activity=activity,
+                location="Pipeline Section B",
+                planned_start=pstart,
+                planned_end=pend,
+                progress_percent=cp101_actuals.get("progress_percent"),
+                status=cp101_actuals.get("status"),
+                delay_days=cp101_actuals.get("delay_days"),
+                delay_reason=cp101_actuals.get("delay_reason"),
+                actual_start_date=cp101_actuals.get("actual_start_date"),
+                actual_end_date=cp101_actuals.get("actual_end_date"),
+                confidence_score=95.0,
+                processed_at="2026-09-17T12:00:00",
+            )
+        else:
+            row = _row(
+                task_id=uid,
+                source_task_id=sid,
+                activity=activity,
+                location="Pipeline Section B",
+                planned_start=pstart,
+                planned_end=pend,
+                progress_percent=None,
+                status=None,
+                delay_days=None,
+                delay_reason=None,
+                actual_start_date=None,
+                actual_end_date=None,
+                confidence_score=None,
+                processed_at=None,
+            )
+        all_tasks.append(row)
+        for up_uid in up_uids:
+            dep_rows.append(_row(downstream_task_id=uid, upstream_task_id=up_uid))
+
+    return all_tasks, dep_rows
+
+
+class CPMScheduleEngineScenariosTests(unittest.TestCase):
+    """Tests verifying Scenarios A to F requirements for deterministic CPM schedule math."""
+
+    def test_scenario_a_on_time_predecessor_cp101(self):
+        """SCENARIO A: CP101 completed on time (17-Sep finish vs 17-Sep planned).
+
+        Must yield:
+        - CP101: 100% progress, status=completed, remaining=0, actual_end=17-Sep, finish slip=0.
+        - All 16 downstream tasks (CP102..CP117): cascade_slip_days=0, at_risk=False, 0 downstream affected.
+        - No '-1 Day Slip', no 'remaining 20%', no 'Estimated +1d delay'.
+        """
+        all_tasks, dep_rows = _build_cp_dataset(
+            cp101_actuals={
+                "progress_percent": 100.0,
+                "status": "completed",
+                "actual_start_date": "2026-09-15",
+                "actual_end_date": "2026-09-17",
+                "delay_days": 0,
+                "delay_reason": None,
+            }
+        )
+        root_row = next(t for t in all_tasks if t.source_task_id == "CP101")
+
+        db = MagicMock()
+        db.execute.side_effect = [
+            MagicMock(fetchone=lambda: root_row),  # _SINGLE_TASK_QUERY
+            MagicMock(fetchall=lambda: all_tasks), # _ALL_TASKS_QUERY
+            MagicMock(fetchall=lambda: dep_rows),  # _ALL_DEPENDENCIES_QUERY
+        ]
+
+        result = get_task_impact(db, CP101_UUID)
+        self.assertIsNotNone(result)
+        assert result is not None
+
+        # Root task verification
+        root = result["task"]
+        self.assertEqual(root["source_task_id"], "CP101")
+        self.assertEqual(root["status"], "completed")
+        self.assertEqual(root["progress_percent"], 100.0)
+        self.assertEqual(root["actual_end_date"], "2026-09-17")
+        self.assertEqual(root["remaining_work_percent"], 0.0)
+        self.assertEqual(root["slip_days"], 0)
+        self.assertEqual(result["slip_days"], 0)
+        self.assertEqual(root["deviation"]["end_deviation_days"], 0)
+        self.assertEqual(root["deviation"]["effective_delay_days"], 0)
+        self.assertEqual(root["deviation"]["schedule_health"], "on_time")
+
+        # Downstream impact verification
+        self.assertEqual(result["total_descendants_count"], 16)
+        self.assertEqual(result["downstream_affected_count"], 0)
+
+        for task in result["downstream"]:
+            self.assertEqual(task["cascade_slip_days"], 0, f"{task['source_task_id']} should have 0 slip")
+            self.assertFalse(task["at_risk"], f"{task['source_task_id']} should not be at risk")
+            self.assertEqual(task["impact_type"], "on_track")
+            self.assertIn(task["schedule_health"], ("on_time", "unassessed"))
+
+    def test_scenario_b_genuinely_delayed_predecessor_cp101(self):
+        """SCENARIO B: CP101 genuinely finishes 2 days late (actual_end=19-Sep vs planned=17-Sep).
+
+        Must yield:
+        - CP101: positive confirmed finish variance = 2 days, slip = 2 days.
+        - CP102 (planned 18-Sep..21-Sep): earliest start = 20-Sep, cascade slip = 2 days, controlling pred = CP101.
+        - CP103 (planned 22-Sep..27-Sep): earliest start = 24-Sep, cascade slip = 2 days, controlling pred = CP102.
+        - Downstream affected count > 0.
+        """
+        all_tasks, dep_rows = _build_cp_dataset(
+            cp101_actuals={
+                "progress_percent": 100.0,
+                "status": "completed",
+                "actual_start_date": "2026-09-15",
+                "actual_end_date": "2026-09-19",
+                "delay_days": 2,
+                "delay_reason": "Equipment breakdown",
+            }
+        )
+        root_row = next(t for t in all_tasks if t.source_task_id == "CP101")
+
+        db = MagicMock()
+        db.execute.side_effect = [
+            MagicMock(fetchone=lambda: root_row),
+            MagicMock(fetchall=lambda: all_tasks),
+            MagicMock(fetchall=lambda: dep_rows),
+        ]
+
+        result = get_task_impact(db, CP101_UUID)
+        self.assertIsNotNone(result)
+        assert result is not None
+
+        self.assertEqual(result["slip_days"], 2)
+        self.assertGreater(result["downstream_affected_count"], 0)
+
+        downstream_map = {t["source_task_id"]: t for t in result["downstream"]}
+        cp102 = downstream_map["CP102"]
+        self.assertEqual(cp102["controlling_predecessor"], "CP101")
+        self.assertEqual(cp102["earliest_feasible_start"], "2026-09-20")
+        self.assertEqual(cp102["cascade_slip_days"], 2)
+        self.assertTrue(cp102["at_risk"])
+        self.assertEqual(cp102["forecast_start"], "2026-09-20")
+        self.assertEqual(cp102["forecast_end"], "2026-09-23")
+
+        cp103 = downstream_map["CP103"]
+        self.assertEqual(cp103["controlling_predecessor"], "CP102")
+        self.assertEqual(cp103["earliest_feasible_start"], "2026-09-24")
+        self.assertEqual(cp103["cascade_slip_days"], 2)
+        self.assertTrue(cp103["at_risk"])
+
+    def test_scenario_c_multiple_parallel_predecessors(self):
+        """SCENARIO C: CP105 depends on CP103 (ends 27-Sep) and CP104 (ends 28-Sep).
+
+        When CP104 is delayed by 2 days (finishes 30-Sep instead of 28-Sep):
+        - CP105 earliest start = 01-Oct (controlling predecessor = CP104), cascade slip = 2 days.
+        - Parallel branch CP106 (depends only on CP103) is NOT a descendant of CP104 and remains unaffected.
+        """
+        all_tasks, dep_rows = _build_cp_dataset()
+        # Set CP104 as delayed by 2 days
+        cp104_row = next(t for t in all_tasks if t.source_task_id == "CP104")
+        cp104_row.actual_end_date = "2026-09-30"
+        cp104_row.delay_days = 2
+        cp104_row.status = "delayed"
+
+        # CP103 finished on time
+        cp103_row = next(t for t in all_tasks if t.source_task_id == "CP103")
+        cp103_row.actual_end_date = "2026-09-27"
+        cp103_row.status = "completed"
+
+        db = MagicMock()
+        db.execute.side_effect = [
+            MagicMock(fetchone=lambda: cp104_row),
+            MagicMock(fetchall=lambda: all_tasks),
+            MagicMock(fetchall=lambda: dep_rows),
+        ]
+
+        result = get_task_impact(db, CP104_UUID)
+        self.assertIsNotNone(result)
+        assert result is not None
+
+        downstream_map = {t["source_task_id"]: t for t in result["downstream"]}
+        self.assertIn("CP105", downstream_map)
+        cp105 = downstream_map["CP105"]
+        self.assertEqual(cp105["controlling_predecessor"], "CP104")
+        self.assertEqual(cp105["earliest_feasible_start"], "2026-10-01")
+        self.assertEqual(cp105["cascade_slip_days"], 2)
+        self.assertTrue(cp105["at_risk"])
+
+        # CP106 is an independent parallel branch depending only on CP103; not downstream of CP104
+        self.assertNotIn("CP106", downstream_map)
+
+    def test_scenario_d_buffer_absorption(self):
+        """SCENARIO D: Predecessor delayed by 2 days, but 4 days of schedule buffer exist.
+
+        - Predecessor ends 12-Sep (planned 10-Sep, delayed 2 days).
+        - Successor planned start is 15-Sep (buffer: 11, 12, 13, 14-Sep).
+        - Earliest start = 13-Sep <= 15-Sep.
+        - Result: cascade_slip_days = 0, at_risk = False.
+        """
+        task_a = _row(
+            task_id="uuid-a",
+            source_task_id="TASK_A",
+            activity="Trenching",
+            location="Site A",
+            planned_start="2026-09-01",
+            planned_end="2026-09-10",
+            progress_percent=100.0,
+            status="completed",
+            delay_days=2,
+            delay_reason="Slow digging",
+            actual_start_date="2026-09-01",
+            actual_end_date="2026-09-12",
+            confidence_score=90.0,
+            processed_at="2026-09-12T12:00:00",
+        )
+        task_b = _row(
+            task_id="uuid-b",
+            source_task_id="TASK_B",
+            activity="Piping",
+            location="Site A",
+            planned_start="2026-09-15",
+            planned_end="2026-09-20",
+            progress_percent=None,
+            status=None,
+            delay_days=None,
+            delay_reason=None,
+            actual_start_date=None,
+            actual_end_date=None,
+            confidence_score=None,
+            processed_at=None,
+        )
+        dep = _row(downstream_task_id="uuid-b", upstream_task_id="uuid-a")
+
+        db = MagicMock()
+        db.execute.side_effect = [
+            MagicMock(fetchone=lambda: task_a),
+            MagicMock(fetchall=lambda: [task_a, task_b]),
+            MagicMock(fetchall=lambda: [dep]),
+        ]
+
+        result = get_task_impact(db, "uuid-a")
+        self.assertIsNotNone(result)
+        assert result is not None
+
+        self.assertEqual(len(result["downstream"]), 1)
+        b_res = result["downstream"][0]
+        self.assertEqual(b_res["source_task_id"], "TASK_B")
+        self.assertEqual(b_res["earliest_feasible_start"], "2026-09-13")
+        self.assertEqual(b_res["cascade_slip_days"], 0)
+        self.assertFalse(b_res["at_risk"])
+        self.assertEqual(b_res["impact_type"], "on_track")
+
+    def test_scenario_e_unknown_actual_finish(self):
+        """SCENARIO E: In-progress task with NULL actual_end_date.
+
+        - end_deviation_days must be None (do NOT invent 0).
+        - effective_delay_days must be None (if no delay reported).
+        - remaining_work_percent must be computed correctly (100 - progress).
+        """
+        from app.schedule_linker import calculate_schedule_deviation
+
+        dev = calculate_schedule_deviation(
+            planned_start="2026-09-01",
+            planned_end="2026-09-10",
+            actual_start="2026-09-01",
+            actual_end=None,
+            status="in_progress",
+            progress_percent=40.0,
+            delay_days=None,
+        )
+        self.assertIsNone(dev["end_deviation_days"])
+        self.assertIsNone(dev["effective_delay_days"])
+        self.assertEqual(dev["remaining_work_percent"], 60.0)
+        self.assertEqual(dev["slip_days"], 0)
+
+    def test_scenario_f_100_percent_completion(self):
+        """SCENARIO F: Explicit 100% progress or status=completed.
+
+        - remaining_work_percent must be exactly 0.0.
+        - schedule_health must be on_time when finished on planned end.
+        """
+        from app.schedule_linker import calculate_schedule_deviation
+
+        dev = calculate_schedule_deviation(
+            planned_start="2026-09-15",
+            planned_end="2026-09-17",
+            actual_start="2026-09-15",
+            actual_end="2026-09-17",
+            status="completed",
+            progress_percent=100.0,
+        )
+        self.assertEqual(dev["remaining_work_percent"], 0.0)
+        self.assertEqual(dev["end_deviation_days"], 0)
+        self.assertEqual(dev["slip_days"], 0)
+        self.assertEqual(dev["schedule_health"], "on_time")
+
+
 if __name__ == "__main__":
     unittest.main()

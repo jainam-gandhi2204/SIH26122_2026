@@ -219,20 +219,27 @@ export function useDashboardData() {
   // 2. Schedule Variance & Delayed Task
   const delayedTasks = tasks.filter(
     (t) =>
-      t.schedule_health === 'delayed' ||
-      (t.delay_days && t.delay_days > 0) ||
-      (t.status && t.status.toLowerCase().includes('delay'))
+      (t.status || '').toLowerCase() !== 'completed' &&
+      (t.progress_percent ?? 0) < 100 &&
+      (t.schedule_health === 'delayed' ||
+       (t.delay_days && t.delay_days > 0) ||
+       (t.deviation?.effective_delay_days && t.deviation.effective_delay_days > 0) ||
+       ((t.status || '').toLowerCase().includes('delay') && ((t.delay_days && t.delay_days > 0) || (t.deviation?.effective_delay_days && t.deviation.effective_delay_days > 0))))
   );
 
   const criticalDelayedTask = delayedTasks.length > 0
-    ? delayedTasks.reduce((max, t) => ((t.delay_days || 0) >= (max.delay_days || 0) ? t : max), delayedTasks[0])
+    ? delayedTasks.reduce((max, t) => {
+        const tSlip = t.delay_days ?? t.deviation?.effective_delay_days ?? t.deviation?.slip_days ?? 0;
+        const maxSlip = max.delay_days ?? max.deviation?.effective_delay_days ?? max.deviation?.slip_days ?? 0;
+        return tSlip >= maxSlip ? t : max;
+      }, delayedTasks[0])
     : null;
 
   const criticalDeviation = criticalDelayedTask
     ? {
-        task_id: criticalDelayedTask.task_id,
-        task_name: criticalDelayedTask.task_name,
-        slipDays: criticalDelayedTask.delay_days || 1,
+        task_id: criticalDelayedTask.source_task_id || criticalDelayedTask.task_id,
+        task_name: criticalDelayedTask.activity || criticalDelayedTask.task_name,
+        slipDays: criticalDelayedTask.delay_days ?? criticalDelayedTask.deviation?.effective_delay_days ?? criticalDelayedTask.deviation?.slip_days ?? 0,
         reason: criticalDelayedTask.delay_reason || 'critical path weather and operational disruption',
         progress_percent: Math.round(criticalDelayedTask.progress_percent || 0),
       }
