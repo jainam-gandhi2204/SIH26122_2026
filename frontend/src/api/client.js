@@ -3,7 +3,7 @@
  * Communicates directly with FastAPI backend via Vite proxy.
  */
 
-const BASE_URL = '';
+const BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
 
 async function request(url, options = {}) {
   const config = {
