@@ -441,7 +441,7 @@ class ReviewResolveRequest(BaseModel):
 @app.get("/review/queue", tags=["review"])
 @app.get("/planner/review-queue", tags=["review"])
 def get_planner_review_queue(
-    threshold: float = 70.0,
+    threshold: float = review_queue.DEFAULT_CONFIDENCE_THRESHOLD,
     status_filter: str = Query("pending", alias="status", description="Filter by review status: 'pending', 'resolved', or 'all'"),
     db: Session = Depends(get_db),
 ) -> list[dict]:
@@ -449,7 +449,7 @@ def get_planner_review_queue(
 
     Includes all AI-processed updates where:
     - matched_task_id is null (no schedule task could be linked), or
-    - confidence_score is below the threshold (default: 70.0), or
+    - confidence_score is below the threshold (default: 80.0), or
     - multiple candidate matches caused ambiguity.
 
     Returns raw update text, extracted activity/progress/status, confidence,

@@ -3,7 +3,7 @@
 Responsibilities
 ----------------
 1. Identify AI-processed updates where matched_task_id IS NULL, confidence_score
-   is below a given threshold (default: 70.0), or multiple candidate matches cause ambiguity.
+   is below a given threshold (default: 80.0), or multiple candidate matches cause ambiguity.
 2. Retrieve these items for planner review with complete context:
    - raw site update text, reported date, location, and source reference
    - extracted activity, progress_percent, status, delays, and actual dates
@@ -32,9 +32,12 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.ai_processor import update_schedule_task_actuals
+from app.ai_processor import (
+    AUTO_LINK_CONFIDENCE_THRESHOLD,
+    update_schedule_task_actuals,
+)
 
-DEFAULT_CONFIDENCE_THRESHOLD: float = 70.0
+DEFAULT_CONFIDENCE_THRESHOLD: float = AUTO_LINK_CONFIDENCE_THRESHOLD
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +325,26 @@ def _determine_review_reason(
     return "low_confidence"
 
 
+def format_review_trigger_message(
+    reason: str,
+    confidence: float | None,
+    threshold: float | None = None,
+) -> str:
+    """Format human-readable review trigger message using authoritative threshold."""
+    conf_pct = round(confidence) if confidence is not None else 0
+    thresh_val = threshold if threshold is not None else DEFAULT_CONFIDENCE_THRESHOLD
+    thresh_pct = round(thresh_val)
+    if reason == "unmatched_and_low_confidence":
+        return "No schedule activity matched & AI confidence is low"
+    if reason == "unmatched":
+        return "No schedule activity could be linked to this update"
+    if reason == "low_confidence":
+        return f"AI match confidence ({conf_pct}%) is below {thresh_pct}% threshold"
+    if reason == "ambiguous_match":
+        return "Multiple candidate activities matched at this location"
+    return reason.replace("_", " ") if reason else "Requires planner validation"
+
+
 # ---------------------------------------------------------------------------
 # Public Query API
 # ---------------------------------------------------------------------------
@@ -450,7 +473,9 @@ def get_review_queue(
             "actual_start_date": str(r.actual_start_date) if r.actual_start_date else None,
             "actual_end_date": str(r.actual_end_date) if r.actual_end_date else None,
             "confidence_score": conf,
+            "threshold": float(threshold),
             "review_reason": reason,
+            "review_trigger_message": format_review_trigger_message(reason, conf, threshold),
             "review_status": review_state,
             "current_matched_task": current_match,
             "suggested_match": suggested,

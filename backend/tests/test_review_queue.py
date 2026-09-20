@@ -13,6 +13,10 @@ from unittest.mock import MagicMock, call, patch
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import OperationalError
 
+from app.ai_processor import (
+    AUTO_LINK_CONFIDENCE_THRESHOLD,
+    PLANNER_REVIEW_MIN_THRESHOLD,
+)
 from app.database import get_db
 from app.main import app
 from app.review_queue import (
@@ -27,6 +31,7 @@ from app.review_queue import (
     _parse_model_response,
     approve_match,
     change_matched_task,
+    format_review_trigger_message,
     get_review_queue,
     reject_match,
     resolve_review_item,
@@ -753,6 +758,99 @@ class RegressionScenario2ProjectIsolationTests(unittest.TestCase):
         ]
         all_items = get_review_queue(db, status="all")
         self.assertEqual(len(all_items), 2)
+
+
+class ReviewQueueThresholdRegressionTests(unittest.TestCase):
+    """Regression tests for 80% auto-link threshold synchronization and dead zone elimination."""
+
+    def test_default_threshold_matches_auto_link_threshold(self):
+        """DEFAULT_CONFIDENCE_THRESHOLD must equal 80.0 and match AUTO_LINK_CONFIDENCE_THRESHOLD."""
+        self.assertEqual(DEFAULT_CONFIDENCE_THRESHOLD, 80.0)
+        self.assertEqual(DEFAULT_CONFIDENCE_THRESHOLD, AUTO_LINK_CONFIDENCE_THRESHOLD)
+        self.assertEqual(PLANNER_REVIEW_MIN_THRESHOLD, 50.0)
+
+    def test_dead_zone_items_included_with_default_threshold(self):
+        """Updates in the 50.0–79.99% range (e.g. 71.0%, 77.5%) must be queried with threshold=80.0."""
+        mock_db = MagicMock()
+        mock_db.execute.return_value.fetchall.side_effect = [
+            [],  # _REVIEW_QUEUE_QUERY
+            [],  # _ALL_SCHEDULE_TASKS_QUERY
+        ]
+
+        # Call with default threshold
+        get_review_queue(mock_db)
+
+        # Inspect the SQL bind parameters passed to _REVIEW_QUEUE_QUERY
+        first_call = mock_db.execute.call_args_list[0]
+        bind_params = first_call[0][1]
+        self.assertEqual(bind_params.get("threshold"), 80.0)
+
+    def test_api_endpoint_uses_default_threshold_80(self):
+        """FastAPI route /planner/review-queue must default to 80.0 threshold."""
+        import inspect
+        from app.main import get_planner_review_queue
+
+        sig = inspect.signature(get_planner_review_queue)
+        param = sig.parameters["threshold"]
+        self.assertEqual(param.default, 80.0)
+
+    def test_format_review_trigger_message_uses_configured_80_threshold(self):
+        """Review trigger message must dynamically use 80% threshold rather than hardcoded 70%."""
+        msg_default = format_review_trigger_message("low_confidence", 77.5)
+        self.assertEqual(msg_default, "AI match confidence (78%) is below 80% threshold")
+
+        msg_explicit = format_review_trigger_message("low_confidence", 71.0, threshold=80.0)
+        self.assertEqual(msg_explicit, "AI match confidence (71%) is below 80% threshold")
+
+        msg_custom = format_review_trigger_message("low_confidence", 75.0, threshold=85.0)
+        self.assertEqual(msg_custom, "AI match confidence (75%) is below 85% threshold")
+
+        msg_unmatched = format_review_trigger_message("unmatched", None)
+        self.assertEqual(msg_unmatched, "No schedule activity could be linked to this update")
+
+    def test_review_queue_items_include_threshold_and_trigger_message(self):
+        """get_review_queue items must contain threshold and authoritative review_trigger_message."""
+        mock_row = _row(
+            processed_id="p-100",
+            site_update_id="su-100",
+            source_update_id="U100",
+            reported_on="2026-09-21",
+            location="Pipeline Section B",
+            raw_update="ROW clearing completed today",
+            source_reference=None,
+            matched_task_id="task-cs102",
+            progress_percent=100.0,
+            status="completed",
+            delay_days=None,
+            delay_reason=None,
+            actual_start_date=None,
+            actual_end_date=None,
+            confidence_score=77.5,
+            model_name="test-model",
+            model_response='{"review_status": "pending"}',
+            processed_at="2026-09-21T10:00:00",
+            matched_st_id="task-cs102",
+            matched_source_task_id="CS102",
+            matched_activity="Right of Way Clearance",
+            matched_location="Pipeline Section B",
+            matched_planned_start="2026-09-18",
+            matched_planned_end="2026-09-21",
+        )
+        mock_db = MagicMock()
+        mock_db.execute.return_value.fetchall.side_effect = [
+            [mock_row],  # _REVIEW_QUEUE_QUERY
+            [],          # _ALL_SCHEDULE_TASKS_QUERY
+        ]
+
+        items = get_review_queue(mock_db)
+        self.assertEqual(len(items), 1)
+        item = items[0]
+        self.assertEqual(item["threshold"], 80.0)
+        self.assertEqual(item["review_reason"], "low_confidence")
+        self.assertEqual(
+            item["review_trigger_message"],
+            "AI match confidence (78%) is below 80% threshold",
+        )
 
 
 if __name__ == "__main__":

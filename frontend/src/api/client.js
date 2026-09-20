@@ -184,7 +184,7 @@ export const uploadSiteUpdatesSpreadsheet = importSpreadsheet;
 // Planner Review Queue APIs
 // ---------------------------------------------------------------------------
 
-export async function getReviewQueue(status = 'pending', threshold = 70.0) {
+export async function getReviewQueue(status = 'pending', threshold = 80.0) {
   return request(`/planner/review-queue?status=${encodeURIComponent(status)}&threshold=${threshold}`);
 }
 

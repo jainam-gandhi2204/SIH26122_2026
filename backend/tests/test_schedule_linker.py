@@ -19,6 +19,9 @@ from collections import namedtuple
 from unittest.mock import MagicMock, call, patch
 
 from app.schedule_linker import (
+    _ALL_TASKS_QUERY,
+    _LINKED_TASKS_QUERY,
+    _SINGLE_TASK_QUERY,
     _fmt_linked,
     _fmt_task,
     _is_concerning,
@@ -992,6 +995,94 @@ class CPMScheduleEngineScenariosTests(unittest.TestCase):
         self.assertEqual(dev["end_deviation_days"], 0)
         self.assertEqual(dev["slip_days"], 0)
         self.assertEqual(dev["schedule_health"], "on_time")
+
+
+class ScheduleLinkerAuthoritativeActualsTests(unittest.TestCase):
+    """Regression tests ensuring schedule_tasks table is strictly authoritative for actuals."""
+
+    def test_queries_do_not_contain_coalesce_for_actuals(self):
+        """_LINKED_TASKS_QUERY, _SINGLE_TASK_QUERY, and _ALL_TASKS_QUERY must not fall back to ap for progress/status."""
+        for name, query in [
+            ("_LINKED_TASKS_QUERY", _LINKED_TASKS_QUERY),
+            ("_SINGLE_TASK_QUERY", _SINGLE_TASK_QUERY),
+            ("_ALL_TASKS_QUERY", _ALL_TASKS_QUERY),
+        ]:
+            sql_text = str(query.text)
+            self.assertNotIn(
+                "COALESCE(st.progress_percent",
+                sql_text,
+                f"{name} must not COALESCE progress_percent with AI data",
+            )
+            self.assertNotIn(
+                "COALESCE(st.status",
+                sql_text,
+                f"{name} must not COALESCE status with AI data",
+            )
+            self.assertNotIn(
+                "COALESCE(st.delay_days",
+                sql_text,
+                f"{name} must not COALESCE delay_days with AI data",
+            )
+            self.assertNotIn(
+                "COALESCE(st.actual_start_date",
+                sql_text,
+                f"{name} must not COALESCE actual_start_date with AI data",
+            )
+            self.assertNotIn(
+                "COALESCE(st.actual_end_date",
+                sql_text,
+                f"{name} must not COALESCE actual_end_date with AI data",
+            )
+
+    def test_unapproved_ai_updates_do_not_leak_into_schedule_actuals(self):
+        """When schedule_tasks row has NULL progress and status, _fmt_linked must NOT report AI values."""
+        # Row simulating schedule_tasks joined with unapproved AI result (e.g. CS102, 77.5% confidence)
+        row = _row(
+            task_id="uuid-cs102",
+            source_task_id="CS102",
+            activity="Right of Way Clearance",
+            location="Pipeline Section B",
+            planned_start="2026-09-18",
+            planned_end="2026-09-21",
+            progress_percent=None,  # Not approved, NULL in schedule_tasks
+            status=None,            # Not approved, NULL in schedule_tasks
+            delay_days=None,
+            delay_reason=None,
+            actual_start_date=None,
+            actual_end_date=None,
+            confidence_score=77.5,
+            processed_at="2026-09-21T10:00:00",
+            ai_matched_task_id="uuid-cs102",
+        )
+        res = _fmt_linked(row)
+        self.assertIsNone(res["status"])
+        self.assertIsNone(res["progress_percent"])
+        self.assertEqual(res["schedule_health"], "unassessed")
+        self.assertEqual(res["confidence_score"], 77.5)
+
+    def test_completed_task_retains_completed_status(self):
+        """When schedule_tasks row has status='completed' and progress_percent=100.0, _fmt_linked preserves completed."""
+        row = _row(
+            task_id="uuid-cs101",
+            source_task_id="CS101",
+            activity="Site Survey and Route Marking",
+            location="Pipeline Section B",
+            planned_start="2026-09-15",
+            planned_end="2026-09-17",
+            progress_percent=100.0,
+            status="completed",
+            delay_days=0,
+            delay_reason=None,
+            actual_start_date="2026-09-15",
+            actual_end_date="2026-09-17",
+            confidence_score=98.2,
+            processed_at="2026-09-17T10:00:00",
+            ai_matched_task_id="uuid-cs101",
+        )
+        res = _fmt_linked(row)
+        self.assertEqual(res["status"], "completed")
+        self.assertEqual(res["progress_percent"], 100.0)
+        self.assertEqual(res["schedule_health"], "on_time")
 
 
 if __name__ == "__main__":

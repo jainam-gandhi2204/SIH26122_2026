@@ -4,15 +4,16 @@ import { formatDateRange, formatRelativeTime } from '../utils/formatters';
 /**
  * Format the review trigger reason into a concise, human-readable alert message.
  */
-function formatReviewReason(reason, confidence) {
+export function formatReviewReason(reason, confidence, threshold = 80) {
   const confPct = confidence !== null && confidence !== undefined ? Math.round(confidence) : 0;
+  const threshPct = threshold !== null && threshold !== undefined ? Math.round(threshold) : 80;
   switch (reason) {
     case 'unmatched_and_low_confidence':
       return 'No schedule activity matched & AI confidence is low';
     case 'unmatched':
       return 'No schedule activity could be linked to this update';
     case 'low_confidence':
-      return `AI match confidence (${confPct}%) is below 70% threshold`;
+      return `AI match confidence (${confPct}%) is below ${threshPct}% threshold`;
     case 'ambiguous_match':
       return 'Multiple candidate activities matched at this location';
     default:
@@ -27,6 +28,7 @@ function formatReviewReason(reason, confidence) {
 export default function PlannerReviewQueueCard({
   items = [],
   scheduleTasks = [],
+  threshold = 80,
   isLoading = false,
   error = null,
   onApprove,
@@ -296,7 +298,7 @@ export default function PlannerReviewQueueCard({
           <div className="text-[11px] text-amber-800 bg-amber-50/90 px-2.5 py-1 rounded border border-amber-200 mb-2 font-medium flex items-center justify-between">
             <span className="flex items-center gap-1">
               <span className="font-bold">⚠️ Review Trigger:</span>
-              <span>{formatReviewReason(activeItem.review_reason, confScore)}</span>
+              <span>{activeItem.review_trigger_message || formatReviewReason(activeItem.review_reason, confScore, activeItem.threshold ?? threshold)}</span>
             </span>
             {activeItem.location && (
               <span className="text-[10px] text-slate-500 font-semibold">{activeItem.location}</span>

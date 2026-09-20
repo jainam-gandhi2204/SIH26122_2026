@@ -152,13 +152,24 @@ export function getStatusBadgeConfig(status) {
       textColor: 'text-amber-600',
     };
   }
-  if (clean.includes('progress') || clean.includes('on_time')) {
+  if (clean.includes('progress')) {
     return {
       label: 'In Progress',
       bg: 'bg-blue-100',
       text: 'text-blue-700',
       dot: 'bg-blue-600',
       border: 'border-blue-500',
+      progressBg: 'bg-teal-500',
+      textColor: 'text-teal-600',
+    };
+  }
+  if (clean.includes('on_time') || clean.includes('on_schedule')) {
+    return {
+      label: 'On Schedule',
+      bg: 'bg-teal-100',
+      text: 'text-teal-800',
+      dot: 'bg-teal-500',
+      border: 'border-teal-500',
       progressBg: 'bg-teal-500',
       textColor: 'text-teal-600',
     };

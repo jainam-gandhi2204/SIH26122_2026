@@ -58,6 +58,14 @@ from app.ai_provider import (
 
 
 # ---------------------------------------------------------------------------
+# Thresholds
+# ---------------------------------------------------------------------------
+
+AUTO_LINK_CONFIDENCE_THRESHOLD: float = 80.0
+PLANNER_REVIEW_MIN_THRESHOLD: float = 50.0
+
+
+# ---------------------------------------------------------------------------
 # SQL queries
 # ---------------------------------------------------------------------------
 
@@ -518,7 +526,7 @@ def process_site_update(
     #    (baseline planned_start/planned_end are NEVER overwritten;
     #     existing known values are never overwritten with NULL/UNKNOWN;
     #     older/lower-progress updates do not overwrite newer/higher-progress actuals)
-    if result.matched_task_id and result.confidence_score >= 80.0:
+    if result.matched_task_id and result.confidence_score >= AUTO_LINK_CONFIDENCE_THRESHOLD:
         eff_status = result.status
         eff_progress = result.progress_percent
         eff_end = result.actual_end_date

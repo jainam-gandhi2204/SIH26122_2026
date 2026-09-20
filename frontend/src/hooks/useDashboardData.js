@@ -172,6 +172,20 @@ export function useDashboardData() {
   const rawTasks = deviationData.tasks || [];
   const tasks = rawTasks.map((t) => {
     const rawProgress = t.progress_percent ?? t.actual_progress;
+    const numProg = rawProgress !== null && rawProgress !== undefined ? Number(rawProgress) : null;
+    const isCompleted = (t.status || '').toLowerCase() === 'completed' || (numProg !== null && numProg >= 100);
+    const rawStatus = (t.status || '').toLowerCase().trim();
+    let execStatus = 'planned';
+    if (isCompleted) {
+      execStatus = 'completed';
+    } else if (rawStatus === 'delayed') {
+      execStatus = 'delayed';
+    } else if (rawStatus === 'in_progress' || (numProg !== null && numProg > 0)) {
+      execStatus = 'in_progress';
+    } else if (rawStatus && rawStatus !== 'not_started') {
+      execStatus = rawStatus;
+    }
+
     return {
       ...t,
       task_id: t.source_task_id || t.task_id,
@@ -181,9 +195,9 @@ export function useDashboardData() {
       planned_end: t.planned_end,
       actual_start: t.actual_start_date,
       actual_end: t.actual_end_date,
-      progress_percent: rawProgress !== null && rawProgress !== undefined ? Number(rawProgress) : 0,
+      progress_percent: numProg !== null ? numProg : 0,
       has_actual_progress: rawProgress !== null && rawProgress !== undefined,
-      status: t.schedule_health || t.status || 'planned',
+      status: execStatus,
       delay_days: t.deviation?.effective_delay_days ?? t.delay_days ?? null,
       delay_reason: t.delay_reason || null,
       schedule_health: t.schedule_health || null,
@@ -276,7 +290,7 @@ export function useDashboardData() {
     at_risk: summary.at_risk ?? atRiskTasks.length,
     planned: tasks.filter(
       (t) =>
-        !t.status &&
+        (!t.status || t.status === 'planned') &&
         !t.progress_percent &&
         t.schedule_health !== 'at_risk' &&
         t.schedule_health !== 'delayed'

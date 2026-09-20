@@ -5,6 +5,7 @@ import { formatDateTime } from '../utils/formatters';
  * Header row with project title, location, timestamp, and primary action buttons.
  */
 export default function HeaderRow({
+  location = 'Project Site',
   lastUpdated,
   isRefreshing = false,
   onRefresh,
@@ -28,7 +29,7 @@ export default function HeaderRow({
 
       {/* Meta Information Cards & Actions on Right */}
       <div className="flex items-center gap-3">
-        {/* Well Pad Card */}
+        {/* Project Location Card */}
         <div className="bg-white/80 backdrop-blur-sm border border-slate-200/80 rounded-xl px-4 py-2.5 flex items-center gap-3 shadow-xs">
           <div className="text-sky-600">
             <svg className="w-6 h-6 fill-sky-800 text-sky-800" viewBox="0 0 24 24">
@@ -36,7 +37,7 @@ export default function HeaderRow({
             </svg>
           </div>
           <div>
-            <div className="text-[13px] font-bold text-slate-800 leading-tight">Well Pad A</div>
+            <div className="text-[13px] font-bold text-slate-800 leading-tight">{location || 'Project Site'}</div>
             <div className="text-[11px] text-slate-500">Oil India Limited</div>
           </div>
         </div>

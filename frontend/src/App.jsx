@@ -162,6 +162,7 @@ export default function App() {
         <main className="flex-1 px-8 pb-10 space-y-5">
           {/* Header Row */}
           <HeaderRow
+            location={tasks[0]?.location || 'Project Site'}
             lastUpdated={lastUpdated}
             isRefreshing={loading}
             onRefresh={refresh}
