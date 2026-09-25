@@ -47,6 +47,7 @@ from sqlalchemy.orm import Session
 
 from app.ai_provider import (
     AIProvider,
+    ActivityObservation,
     AnalysisResult,
     get_provider,
     normalize_with_aliases,
@@ -54,6 +55,8 @@ from app.ai_provider import (
     _ACTIVITY_SYNONYMS,
     _STOP_WORDS,
     _location_match_score,
+    score_candidate_task,
+    compute_composite_confidence,
 )
 
 
@@ -169,6 +172,7 @@ _INSERT_PROCESSED = text(
         confidence_score,
         model_name,
         model_response,
+        observation_index,
         is_current
     )
     VALUES (
@@ -184,6 +188,7 @@ _INSERT_PROCESSED = text(
         :confidence_score,
         :model_name,
         :model_response,
+        :observation_index,
         true
     )
     RETURNING
@@ -199,6 +204,7 @@ _INSERT_PROCESSED = text(
         confidence_score,
         model_name,
         model_response,
+        observation_index,
         processed_at,
         is_current
     """
@@ -219,13 +225,14 @@ _FETCH_CURRENT_RESULT = text(
         ap.confidence_score,
         ap.model_name,
         ap.model_response,
+        ap.observation_index,
         ap.processed_at,
         ap.is_current
     FROM ai_processed_updates ap
     JOIN site_updates su ON su.id = ap.site_update_id
     WHERE (CAST(ap.site_update_id AS TEXT) = :site_update_id OR su.source_update_id = :site_update_id)
       AND ap.is_current = true
-    LIMIT 1
+    ORDER BY ap.observation_index
     """
 )
 
@@ -262,6 +269,7 @@ def _format_result(row: Any) -> dict[str, Any]:
         "confidence_score": float(row.confidence_score) if row.confidence_score is not None else None,
         "model_name": row.model_name,
         "model_response": model_resp,
+        "observation_index": getattr(row, "observation_index", 0),
         "processed_at": _date(row.processed_at),
         "is_current": row.is_current,
     }
@@ -434,24 +442,39 @@ def process_site_update(
     db: Session,
     update_id: str,
     provider: AIProvider | None = None,
-) -> dict[str, Any]:
-    """Run AI processing for a site update and persist the result.
+) -> list[dict[str, Any]]:
+    """Run AI processing for a site update and persist all extracted observations.
+
+    Phase 2 behaviour:
+    - Primary observation is always observation_index=0.
+    - Additional observations receive deterministic indexes 1, 2, 3... in the
+      order returned by the provider (Gemini: text order; Mock: score-descending).
+    - The previous current observation batch is expired ONCE before any inserts
+      (Safeguard 1 — no per-observation expiry).
+    - Each observation is independently auto-linked or sent to planner review.
+    - A failure in a secondary observation is isolated; it does not abort the
+      remaining observations or the primary (Safeguard 4).
 
     Parameters
     ----------
     db:         Open SQLAlchemy session.
-    update_id:  UUID string of the site_updates row.
+    update_id:  UUID or source_update_id of the site_updates row.
     provider:   Optional override for testing.  If None, uses get_provider().
 
     Returns
     -------
-    Formatted dict of the newly inserted ai_processed_updates row.
+    List of formatted dicts for the inserted ai_processed_updates rows,
+    ordered by observation_index (primary first).  Single-activity updates
+    return a list with exactly one element (Phase 1 compatible).
 
     Raises
     ------
     SiteUpdateNotFoundError  – if the update_id does not exist.
     SQLAlchemyError          – propagated to caller on DB failure.
     """
+    import logging as _logging
+    _logger = _logging.getLogger(__name__)
+
     if provider is None:
         provider = get_provider()
 
@@ -475,6 +498,8 @@ def process_site_update(
         }
         for row in task_rows
     ]
+    # Build source_task_id → UUID map for secondary observation resolution
+    task_id_map: dict[str, str] = {t["source_task_id"]: t["id"] for t in all_candidates}
 
     # 3. Shortlist candidates using multi-signal scoring
     reported_on_str = (
@@ -497,15 +522,16 @@ def process_site_update(
         candidate_tasks=candidate_tasks,
     )
 
-    # 5. Expire the previous current record for this site update
+    # 5. Expire ALL previous current observations for this site update IN ONE SHOT.
+    #    This must happen before any inserts so the new uniqueness constraint
+    #    (site_update_id, observation_index) WHERE is_current=true is never violated.
     db.execute(_EXPIRE_CURRENT, {"site_update_id": update_id})
 
-    # 6. Insert new row
-    new_id = str(uuid.uuid4())
-    inserted_row = db.execute(
+    # 6a. Insert primary observation (observation_index=0) — unchanged Phase 1 path.
+    primary_row = db.execute(
         _INSERT_PROCESSED,
         {
-            "id": new_id,
+            "id": str(uuid.uuid4()),
             "site_update_id": update_id,
             "matched_task_id": result.matched_task_id,
             "progress_percent": result.progress_percent,
@@ -517,16 +543,147 @@ def process_site_update(
             "confidence_score": result.confidence_score,
             "model_name": result.model_name,
             "model_response": json.dumps(result.model_response),
+            "observation_index": 0,
         },
     ).fetchone()
 
-    # 7. Auto-link: if matched with HIGH confidence (>= 80.0), update schedule_tasks actuals.
-    #    MEDIUM (50–79.9): match stored for planner review, but schedule NOT auto-updated.
-    #    LOW (< 50.0): matched_task_id is None (set by provider); no schedule update.
-    #    (baseline planned_start/planned_end are NEVER overwritten;
-    #     existing known values are never overwritten with NULL/UNKNOWN;
-    #     older/lower-progress updates do not overwrite newer/higher-progress actuals)
-    if result.matched_task_id and result.confidence_score >= AUTO_LINK_CONFIDENCE_THRESHOLD:
+    # 7a. Auto-link primary observation if HIGH confidence.
+    #     MEDIUM (50–79.9): match stored for planner review; schedule NOT updated.
+    #     LOW (< 50.0): matched_task_id is None; no schedule update.
+    _maybe_auto_link(db, result.matched_task_id, result.confidence_score, reported_on_str, result)
+
+    inserted_rows: list[dict[str, Any]] = [_format_result(primary_row)]
+
+    # 6b/7b. Insert and process each secondary observation independently.
+    #        Errors in secondary observations are isolated — they do not abort
+    #        the primary or each other (Safeguard 4).
+    for obs_index, obs in enumerate(result.additional_observations, start=1):
+        try:
+            obs_dict, obs_matched_uuid, obs_confidence = _process_secondary_obs(
+                obs=obs,
+                obs_index=obs_index,
+                update_id=update_id,
+                task_id_map=task_id_map,
+                candidate_tasks=candidate_tasks,
+                location=update_row.location or "",
+                raw_update=update_row.raw_update or "",
+                reported_on_str=reported_on_str,
+                model_name=result.model_name,
+            )
+            obs_row = db.execute(_INSERT_PROCESSED, obs_dict).fetchone()
+            _maybe_auto_link(db, obs_matched_uuid, obs_confidence, reported_on_str, None,
+                             obs=obs)
+            inserted_rows.append(_format_result(obs_row))
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning(
+                "Skipping secondary observation %d for update %s: %s: %s",
+                obs_index, update_id, type(exc).__name__, exc,
+            )
+            # Continue — remaining observations are unaffected.
+
+    db.commit()
+    return inserted_rows
+
+
+def _process_secondary_obs(
+    obs: "ActivityObservation",
+    obs_index: int,
+    update_id: str,
+    task_id_map: dict[str, str],
+    candidate_tasks: list[dict[str, Any]],
+    location: str,
+    raw_update: str,
+    reported_on_str: str,
+    model_name: str,
+) -> tuple[dict[str, Any], str | None, float]:
+    """Build the INSERT parameter dict for a secondary observation.
+
+    Returns (params_dict, matched_task_uuid_or_None, composite_confidence).
+    """
+    from app.ai_provider import normalize_with_aliases, _ALL_ALIAS_PAIRS  # noqa: PLC0415
+
+    # Resolve candidate_source_task_id → UUID
+    candidate_id = obs.candidate_source_task_id
+    matched_uuid: str | None = task_id_map.get(candidate_id or "") if candidate_id else None
+
+    # Compute composite confidence for this observation.
+    # We use extraction_confidence as both LLM extraction and match signals
+    # (mock provider doesn't separate them for secondary observations).
+    det_score = 0.0
+    loc_score = 0
+    if candidate_id and matched_uuid:
+        matched_task = next(
+            (t for t in candidate_tasks if t["source_task_id"] == candidate_id), None
+        )
+        if matched_task:
+            norm_raw = normalize_with_aliases(raw_update, _ALL_ALIAS_PAIRS)
+            det_score = score_candidate_task(matched_task, norm_raw, location)
+            loc_score = _location_match_score(
+                matched_task.get("location", "").lower(),
+                location.lower(),
+                raw_update.lower(),
+            )
+
+    obs_confidence = compute_composite_confidence(
+        llm_confidence=obs.extraction_confidence,
+        llm_extraction_confidence=obs.extraction_confidence,
+        deterministic_score=det_score,
+        location_match_score=loc_score,
+    )
+
+    # Apply tier thresholds (same rules as primary)
+    if obs_confidence < PLANNER_REVIEW_MIN_THRESHOLD:
+        matched_uuid = None   # No false match stored
+
+    # Build model_response for audit trail
+    obs_model_response = {
+        "observation_source": "additional_observations",
+        "observation_index": obs_index,
+        "activity_description": obs.activity_description,
+        "candidate_source_task_id": candidate_id,
+        "extraction_confidence": obs.extraction_confidence,
+        "deterministic_score": det_score,
+        "location_match_score": loc_score,
+        "composite_confidence": obs_confidence,
+    }
+
+    params: dict[str, Any] = {
+        "id": str(uuid.uuid4()),
+        "site_update_id": update_id,
+        "matched_task_id": matched_uuid,
+        "progress_percent": obs.progress_percent,
+        "status": obs.status,
+        "delay_days": obs.delay_days,
+        "delay_reason": obs.delay_reason,
+        "actual_start_date": None,
+        "actual_end_date": None,
+        "confidence_score": obs_confidence,
+        "model_name": model_name,
+        "model_response": json.dumps(obs_model_response),
+        "observation_index": obs_index,
+    }
+    return params, matched_uuid, obs_confidence
+
+
+def _maybe_auto_link(
+    db: Session,
+    matched_task_id: str | None,
+    confidence_score: float,
+    reported_on_str: str,
+    result: "AnalysisResult | None",
+    obs: "ActivityObservation | None" = None,
+) -> None:
+    """Apply schedule actuals update when confidence >= AUTO_LINK_CONFIDENCE_THRESHOLD.
+
+    Handles both primary (result is AnalysisResult) and secondary (obs is ActivityObservation).
+    MEDIUM/LOW confidence observations are skipped — the matched_task_id is stored
+    in ai_processed_updates for planner review but schedule_tasks is NOT modified.
+    """
+    if not matched_task_id or confidence_score < AUTO_LINK_CONFIDENCE_THRESHOLD:
+        return
+
+    if result is not None:
+        # Primary observation
         eff_status = result.status
         eff_progress = result.progress_percent
         eff_end = result.actual_end_date
@@ -542,7 +699,7 @@ def process_site_update(
 
         update_schedule_task_actuals(
             db=db,
-            task_id=result.matched_task_id,
+            task_id=matched_task_id,
             reported_on=reported_on_str,
             progress_percent=eff_progress,
             status=eff_status,
@@ -551,11 +708,29 @@ def process_site_update(
             actual_start_date=result.actual_start_date,
             actual_end_date=eff_end,
         )
+    elif obs is not None:
+        # Secondary observation
+        eff_status = obs.status
+        eff_progress = obs.progress_percent
+        eff_delay = obs.delay_days
 
-    db.commit()
-    return _format_result(inserted_row)
+        if eff_status == "completed" or (eff_progress is not None and eff_progress >= 100.0):
+            eff_status = "completed"
+            eff_progress = 100.0
+            if eff_delay is None:
+                eff_delay = 0
 
-
+        update_schedule_task_actuals(
+            db=db,
+            task_id=matched_task_id,
+            reported_on=reported_on_str,
+            progress_percent=eff_progress,
+            status=eff_status,
+            delay_days=eff_delay,
+            delay_reason=obs.delay_reason,
+            actual_start_date=None,
+            actual_end_date=None,
+        )
 
 def update_schedule_task_actuals(
     db: Session,
@@ -614,9 +789,12 @@ def update_schedule_task_actuals(
 def get_current_result(
     db: Session,
     update_id: str,
-) -> dict[str, Any] | None:
-    """Return the current AI-processed result for a site update, or None."""
-    row = db.execute(_FETCH_CURRENT_RESULT, {"site_update_id": update_id}).fetchone()
-    if row is None:
-        return None
-    return _format_result(row)
+) -> list[dict[str, Any]]:
+    """Return all current AI-processed observations for a site update.
+
+    Phase 2: Returns a list ordered by observation_index.
+    Primary observation is always first (index 0).
+    Returns empty list if no current result exists.
+    """
+    rows = db.execute(_FETCH_CURRENT_RESULT, {"site_update_id": update_id}).fetchall()
+    return [_format_result(row) for row in rows]

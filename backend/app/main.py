@@ -1,3 +1,5 @@
+from typing import Any
+
 from fastapi import Depends, FastAPI, HTTPException, Query, UploadFile, status
 from pydantic import BaseModel, Field
 from sqlalchemy import text
@@ -186,7 +188,7 @@ def list_site_updates(
 def process_site_update(
     update_id: str,
     db: Session = Depends(get_db),
-) -> dict:
+) -> list[dict[str, Any]]:
     """Run AI processing for a stored site update and persist the result.
 
     Re-running this endpoint replaces the previous current result (is_current
@@ -212,7 +214,7 @@ def process_site_update(
 def get_site_update_result(
     update_id: str,
     db: Session = Depends(get_db),
-) -> dict:
+) -> list[dict[str, Any]]:
     """Return the current AI-processed result for a site update.
 
     Returns 404 if the update does not exist or has not been processed yet.
@@ -225,7 +227,7 @@ def get_site_update_result(
             detail="Database is unavailable",
         ) from error
 
-    if result is None:
+    if not result:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"No processed result found for update '{update_id}'.",

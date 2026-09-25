@@ -211,6 +211,7 @@ class AnalysisResult:
     confidence_score: float              # 0–100 COMPOSITE score
     model_name: str
     model_response: dict[str, Any]       # full model output for audit trail
+    additional_observations: list[ActivityObservation] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -881,6 +882,7 @@ class MockAIProvider(AIProvider):
 
         # --- Detect multiple activities mentioned (multi-activity readiness) ---
         additional_observations = _detect_additional_activities(raw_update, candidate_tasks, location)
+        typed_additional = _dicts_to_activity_observations(additional_observations)
 
         # --- Build result ---
         model_response: dict[str, Any] = {
@@ -924,6 +926,7 @@ class MockAIProvider(AIProvider):
             confidence_score=composite_confidence,
             model_name=_MOCK_MODEL_NAME,
             model_response=model_response,
+            additional_observations=typed_additional,
         )
 
 
@@ -976,6 +979,58 @@ def _detect_additional_activities(
     return additional
 
 
+# Allowed status values as per the DB CHECK constraint
+_ALLOWED_STATUSES = frozenset(
+    {"not_started", "in_progress", "completed", "delayed", "blocked"}
+)
+
+
+def _dicts_to_activity_observations(
+    obs_dicts: list[dict[str, Any]],
+) -> list[ActivityObservation]:
+    """Convert raw observation dicts (Mock or Gemini) to typed ActivityObservation list.
+
+    Phase 2 bridge: the untyped dicts are kept in model_response for audit trail;
+    this typed list is stored on AnalysisResult for independent persistence.
+    Tolerates missing/malformed fields - a bad entry is skipped safely.
+    """
+    result: list[ActivityObservation] = []
+    for d in obs_dicts:
+        if not isinstance(d, dict):
+            continue
+        # Handle field name differences between Mock and Gemini providers.
+        activity_desc = (
+            _safe_str(d.get("activity_description"))
+            or _safe_str(d.get("activity"))
+            or "Unknown activity"
+        )
+        candidate_id = _safe_str(
+            d.get("candidate_source_task_id") or d.get("source_task_id")
+        )
+        progress = _safe_float(d.get("progress_percent"))
+        status_raw = _safe_str(d.get("status"))
+        status_val = status_raw if status_raw in _ALLOWED_STATUSES else None
+        delay = _safe_int(d.get("delay_days"))
+        delay_r = _safe_str(d.get("delay_reason"))
+        ext_conf_raw = d.get("extraction_confidence") or d.get("keyword_score") or 50.0
+        ext_conf = max(0.0, min(100.0, float(ext_conf_raw)))
+        loc = _safe_str(d.get("location") or d.get("location_mentioned"))
+
+        result.append(
+            ActivityObservation(
+                activity_description=activity_desc,
+                location_mentioned=loc,
+                progress_percent=progress,
+                status=status_val,
+                delay_days=delay if delay is not None and delay >= 0 else None,
+                delay_reason=delay_r,
+                extraction_confidence=ext_conf,
+                candidate_source_task_id=candidate_id,
+            )
+        )
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Provider factory
 # ---------------------------------------------------------------------------
@@ -1002,11 +1057,6 @@ def get_provider() -> AIProvider:
 # ---------------------------------------------------------------------------
 # Gemini provider
 # ---------------------------------------------------------------------------
-
-# Allowed status values as per the DB CHECK constraint
-_ALLOWED_STATUSES = frozenset(
-    {"not_started", "in_progress", "completed", "delayed", "blocked"}
-)
 
 _GEMINI_MODEL = "gemini-3.6-flash"
 
@@ -1429,9 +1479,10 @@ class GeminiAIProvider(AIProvider):
             matched_source = None
 
         # --- Step 6: multi-activity additional observations ---
-        additional_obs = parsed.get("additional_observations")
-        if not isinstance(additional_obs, list):
-            additional_obs = None
+        additional_obs_raw = parsed.get("additional_observations")
+        if not isinstance(additional_obs_raw, list):
+            additional_obs_raw = []
+        typed_additional = _dicts_to_activity_observations(additional_obs_raw)
 
         return AnalysisResult(
             matched_task_id=matched_task_uuid,
@@ -1452,8 +1503,9 @@ class GeminiAIProvider(AIProvider):
                 "composite_confidence": composite,
                 "deterministic_score": det_score,
                 "location_match_score": loc_match_score,
-                "additional_observations": additional_obs,
+                "additional_observations": additional_obs_raw,
             },
+            additional_observations=typed_additional,
         )
 
 

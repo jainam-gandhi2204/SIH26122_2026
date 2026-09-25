@@ -119,6 +119,10 @@ export default function IngestModal({
     }
   };
 
+  const primaryObs = Array.isArray(feedback?.details)
+    ? (feedback.details[0] || null)
+    : feedback?.details;
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs transition-opacity animate-in fade-in">
       <div className="bg-white rounded-2xl shadow-2xl border border-slate-200 w-full max-w-xl overflow-hidden flex flex-col max-h-[90vh]">
@@ -195,38 +199,38 @@ export default function IngestModal({
                 <div className="font-bold">{feedback.message}</div>
 
                 {/* Free-text AI extraction details */}
-                {feedback.details && (feedback.details.matched_task_id || feedback.details.model_response || feedback.details.progress_percent !== undefined) && (
+                {primaryObs && (primaryObs.matched_task_id || primaryObs.model_response || primaryObs.progress_percent !== undefined) && (
                   <div className="text-[11px] bg-white/90 border border-emerald-200 rounded-lg p-2.5 space-y-1 text-slate-800 shadow-xs">
                     <div className="flex items-center justify-between">
                       <span className="text-slate-500 font-semibold">Matched Activity:</span>
                       <span className="font-mono font-bold text-teal-800 bg-teal-50 px-1.5 py-0.5 rounded">
-                        {feedback.details.model_response?.matched_source_task_id || (feedback.details.matched_task_id ? 'Linked to Schedule' : 'Unmatched (Sent to Review Queue)')}
+                        {primaryObs.model_response?.matched_source_task_id || (primaryObs.matched_task_id ? 'Linked to Schedule' : 'Unmatched (Sent to Review Queue)')}
                       </span>
                     </div>
-                    {feedback.details.progress_percent !== null && feedback.details.progress_percent !== undefined && (
+                    {primaryObs.progress_percent !== null && primaryObs.progress_percent !== undefined && (
                       <div className="flex items-center justify-between">
                         <span className="text-slate-500 font-semibold">Reported Progress:</span>
-                        <span className="font-bold text-slate-800">{feedback.details.progress_percent}%</span>
+                        <span className="font-bold text-slate-800">{primaryObs.progress_percent}%</span>
                       </div>
                     )}
-                    {feedback.details.confidence_score !== null && feedback.details.confidence_score !== undefined && (
+                    {primaryObs.confidence_score !== null && primaryObs.confidence_score !== undefined && (
                       <div className="flex items-center justify-between">
                         <span className="text-slate-500 font-semibold">AI Confidence:</span>
-                        <span className={`font-bold ${feedback.details.confidence_score >= 70 ? 'text-teal-700' : 'text-amber-700'}`}>
-                          {Math.round(feedback.details.confidence_score)}%
-                          {feedback.details.confidence_score < 70 ? ' (Low — Review Required)' : ''}
+                        <span className={`font-bold ${primaryObs.confidence_score >= 70 ? 'text-teal-700' : 'text-amber-700'}`}>
+                          {Math.round(primaryObs.confidence_score)}%
+                          {primaryObs.confidence_score < 70 ? ' (Low — Review Required)' : ''}
                         </span>
                       </div>
                     )}
-                    {feedback.details.delay_days ? (
+                    {primaryObs.delay_days ? (
                       <div className="flex items-center justify-between text-rose-700 font-semibold">
                         <span>Reported Delay:</span>
-                        <span>+{feedback.details.delay_days} day slip ({feedback.details.delay_reason || 'Site condition'})</span>
+                        <span>+{primaryObs.delay_days} day slip ({primaryObs.delay_reason || 'Site condition'})</span>
                       </div>
                     ) : null}
-                    {feedback.details.model_response?.reasoning && (
+                    {primaryObs.model_response?.reasoning && (
                       <div className="pt-1 text-[10px] text-slate-500 border-t border-slate-100 italic">
-                        "{feedback.details.model_response.reasoning}"
+                        "{primaryObs.model_response.reasoning}"
                       </div>
                     )}
                   </div>

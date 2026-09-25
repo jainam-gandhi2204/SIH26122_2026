@@ -143,8 +143,10 @@ export async function ingestSiteUpdate({ text, raw_update, reported_date, report
   const targetUpdateId = created?.source_update_id || generatedSourceId;
   if (targetUpdateId) {
     try {
+      // Phase 2: processSiteUpdate returns an array of observation dicts.
+      // Return it directly so callers receive the typed list.
       const processed = await processSiteUpdate(targetUpdateId);
-      return { created, ...processed };
+      return processed;
     } catch (err) {
       console.warn('Auto AI processing on new update failed:', err);
     }

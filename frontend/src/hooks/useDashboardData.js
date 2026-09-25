@@ -89,7 +89,13 @@ export function useDashboardData() {
         const reviewMap = new Map();
         const allReviewsList = allReviewsRes.status === 'fulfilled' ? (allReviewsRes.value || []) : [];
         allReviewsList.forEach((r) => {
-          if (r.site_update_id) reviewMap.set(String(r.site_update_id), r);
+          if (!r.site_update_id) return;
+          const key = String(r.site_update_id);
+          const existing = reviewMap.get(key);
+          // Prioritize primary observation (observation_index === 0) so secondary observations do not overwrite it
+          if (!existing || r.observation_index === 0) {
+            reviewMap.set(key, r);
+          }
         });
 
         const enrichPromises = rawUpdates.map(async (u) => {
@@ -117,7 +123,8 @@ export function useDashboardData() {
           }
 
           try {
-            const proc = await getSiteUpdateResult(u.id);
+            const procRaw = await getSiteUpdateResult(u.id);
+            const proc = Array.isArray(procRaw) ? (procRaw[0] || null) : procRaw;
             const matchedT = proc?.matched_task_id
               ? (taskMap.get(String(proc.matched_task_id))?.source_task_id || proc.matched_task_id)
               : null;
