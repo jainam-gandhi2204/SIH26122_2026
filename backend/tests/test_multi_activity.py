@@ -807,6 +807,310 @@ class MultiActivityProcessingTests(unittest.TestCase):
             self.assertEqual(o1.progress_percent, o2.progress_percent)
             self.assertEqual(o1.extraction_confidence, o2.extraction_confidence)
 
+    def test_production_observed_report_extraction(self):
+        """Production regression test: exact problem report extracts MC104, MC105, and MC106 independently."""
+        provider = MockAIProvider()
+        tasks = [
+            {"id": "t101", "source_task_id": "MC101", "activity": "Site Survey and Setting Out", "location": "Compressor Station C"},
+            {"id": "t102", "source_task_id": "MC102", "activity": "Site Clearing and Grading", "location": "Compressor Station C"},
+            {"id": "t103", "source_task_id": "MC103", "activity": "Foundation Excavation", "location": "Compressor Station C"},
+            {"id": "t104", "source_task_id": "MC104", "activity": "Foundation Reinforcement", "location": "Compressor Station C"},
+            {"id": "t105", "source_task_id": "MC105", "activity": "Equipment Foundation Concrete", "location": "Compressor Station C"},
+            {"id": "t106", "source_task_id": "MC106", "activity": "Equipment Base Plate Installation", "location": "Compressor Station C"},
+            {"id": "t107", "source_task_id": "MC107", "activity": "Equipment Installation", "location": "Compressor Station C"},
+            {"id": "t108", "source_task_id": "MC108", "activity": "Equipment Alignment and Inspection", "location": "Compressor Station C"},
+            {"id": "t109", "source_task_id": "MC109", "activity": "Electrical Cable Installation", "location": "Compressor Station C"},
+            {"id": "t110", "source_task_id": "MC110", "activity": "Electrical Testing", "location": "Compressor Station C"},
+            {"id": "t111", "source_task_id": "MC111", "activity": "Final Commissioning", "location": "Compressor Station C"},
+        ]
+        raw_text = (
+            "Daily construction update: Foundation reinforcement has been "
+            "completed at 100%. Equipment foundation concrete has reached 60% "
+            "completion and is progressing normally. Equipment base plate "
+            "installation has not started yet."
+        )
+
+        result = provider.analyse(
+            raw_update=raw_text,
+            location="Compressor Station C",
+            reported_on="2026-09-26",
+            candidate_tasks=tasks,
+        )
+
+        # Observation 0 (Foundation Reinforcement -> MC104)
+        self.assertEqual(result.matched_task_id, "t104")
+        self.assertEqual(result.model_response.get("matched_source_task_id"), "MC104")
+        self.assertEqual(result.progress_percent, 100.0)
+        self.assertEqual(result.status, "completed")
+        self.assertGreaterEqual(result.confidence_score, 80.0)
+        self.assertFalse(result.model_response.get("is_ambiguous", False))
+
+        # Two secondary observations extracted
+        self.assertEqual(len(result.additional_observations), 2)
+
+        # Observation 1 (Equipment Foundation Concrete -> MC105)
+        obs1 = result.additional_observations[0]
+        self.assertEqual(obs1.candidate_source_task_id, "MC105")
+        self.assertEqual(obs1.progress_percent, 60.0)
+        self.assertEqual(obs1.status, "in_progress")
+        self.assertGreaterEqual(obs1.extraction_confidence, 80.0)
+        self.assertFalse(obs1.is_ambiguous)
+
+        # Observation 2 (Equipment Base Plate Installation -> MC106)
+        obs2 = result.additional_observations[1]
+        self.assertEqual(obs2.candidate_source_task_id, "MC106")
+        self.assertIsNone(obs2.progress_percent)
+        self.assertEqual(obs2.status, "not_started")
+        self.assertGreaterEqual(obs2.extraction_confidence, 80.0)
+        self.assertFalse(obs2.is_ambiguous)
+
+    def test_scenario_a_three_high_confidence_observations_all_auto_process(self):
+        """Scenario A: 3 high-confidence observations all auto-process and update schedule actuals."""
+        mock_db = MagicMock()
+        update_row = _make_update_row(
+            raw_update=(
+                "Daily construction update: Foundation reinforcement has been "
+                "completed at 100%. Equipment foundation concrete has reached 60% "
+                "completion and is progressing normally. Equipment base plate "
+                "installation has not started yet."
+            ),
+            location="Compressor Station C",
+        )
+        tasks = [
+            MagicMock(id="uuid-104", source_task_id="MC104", activity="Foundation Reinforcement", location="Compressor Station C", planned_start="2026-09-11", planned_end="2026-09-20", status="not_started"),
+            MagicMock(id="uuid-105", source_task_id="MC105", activity="Equipment Foundation Concrete", location="Compressor Station C", planned_start="2026-09-21", planned_end="2026-09-30", status="not_started"),
+            MagicMock(id="uuid-106", source_task_id="MC106", activity="Equipment Base Plate Installation", location="Compressor Station C", planned_start="2026-10-01", planned_end="2026-10-10", status="not_started"),
+        ]
+
+        actuals_updated_tasks = []
+        inserted_rows = []
+
+        def make_row(params):
+            r = MagicMock()
+            for k, v in params.items():
+                setattr(r, k, v)
+            r.processed_at = "2026-09-26T10:00:00"
+            r.is_current = True
+            return r
+
+        def db_execute(stmt, params=None):
+            sql = str(stmt)
+            res = MagicMock()
+            if "FROM site_updates" in sql:
+                res.fetchone.return_value = update_row
+            elif "FROM schedule_tasks" in sql:
+                res.fetchall.return_value = tasks
+            elif "UPDATE schedule_tasks" in sql:
+                p = params or {}
+                actuals_updated_tasks.append(p.get("task_id"))
+            elif "INSERT INTO ai_processed_updates" in sql:
+                p = params or {}
+                row = make_row(p)
+                inserted_rows.append(row)
+                res.fetchone.return_value = row
+            return res
+
+        mock_db.execute.side_effect = db_execute
+
+        res = process_site_update(mock_db, SAMPLE_UPDATE_ID, provider=MockAIProvider())
+
+        # All 3 observations inserted
+        self.assertEqual(len(res), 3)
+        self.assertEqual(res[0]["matched_task_id"], "uuid-104")
+        self.assertEqual(res[1]["matched_task_id"], "uuid-105")
+        self.assertEqual(res[2]["matched_task_id"], "uuid-106")
+
+        # All 3 observations have confidence >= 80.0
+        self.assertGreaterEqual(res[0]["confidence_score"], 80.0)
+        self.assertGreaterEqual(res[1]["confidence_score"], 80.0)
+        self.assertGreaterEqual(res[2]["confidence_score"], 80.0)
+
+        # All 3 tasks independently updated their actuals in schedule_tasks
+        self.assertIn("uuid-104", actuals_updated_tasks)
+        self.assertIn("uuid-105", actuals_updated_tasks)
+        self.assertIn("uuid-106", actuals_updated_tasks)
+        self.assertEqual(len(actuals_updated_tasks), 3)
+
+    def test_scenario_b_two_high_confidence_one_ambiguous(self):
+        """Scenario B: 2 high-confidence auto-process, only the ambiguous one enters review."""
+        mock_db = MagicMock()
+        update_row = _make_update_row(
+            raw_update=(
+                "Foundation reinforcement has been completed at 100%. "
+                "Equipment foundation concrete has reached 60% completion. "
+                "Electrical work has reached 30% progress."
+            ),
+            location="Compressor Station C",
+        )
+        tasks = [
+            MagicMock(id="uuid-104", source_task_id="MC104", activity="Foundation Reinforcement", location="Compressor Station C", planned_start="2026-09-11", planned_end="2026-09-20", status="not_started"),
+            MagicMock(id="uuid-105", source_task_id="MC105", activity="Equipment Foundation Concrete", location="Compressor Station C", planned_start="2026-09-21", planned_end="2026-09-30", status="not_started"),
+            MagicMock(id="uuid-109", source_task_id="MC109", activity="Electrical Cable Installation", location="Compressor Station C", planned_start="2026-10-21", planned_end="2026-10-31", status="not_started"),
+            MagicMock(id="uuid-110", source_task_id="MC110", activity="Electrical Testing", location="Compressor Station C", planned_start="2026-11-01", planned_end="2026-11-10", status="not_started"),
+        ]
+
+        actuals_updated_tasks = []
+        inserted_rows = []
+
+        def make_row(params):
+            r = MagicMock()
+            for k, v in params.items():
+                setattr(r, k, v)
+            r.processed_at = "2026-09-26T10:00:00"
+            r.is_current = True
+            return r
+
+        def db_execute(stmt, params=None):
+            sql = str(stmt)
+            res = MagicMock()
+            if "FROM site_updates" in sql:
+                res.fetchone.return_value = update_row
+            elif "FROM schedule_tasks" in sql:
+                res.fetchall.return_value = tasks
+            elif "UPDATE schedule_tasks" in sql:
+                p = params or {}
+                actuals_updated_tasks.append(p.get("task_id"))
+            elif "INSERT INTO ai_processed_updates" in sql:
+                p = params or {}
+                row = make_row(p)
+                inserted_rows.append(row)
+                res.fetchone.return_value = row
+            return res
+
+        mock_db.execute.side_effect = db_execute
+
+        res = process_site_update(mock_db, SAMPLE_UPDATE_ID, provider=MockAIProvider())
+
+        self.assertEqual(len(res), 3)
+
+        # Observations 0 and 1 are high confidence and auto-processed
+        self.assertGreaterEqual(res[0]["confidence_score"], 80.0)
+        self.assertGreaterEqual(res[1]["confidence_score"], 80.0)
+        self.assertIn("uuid-104", actuals_updated_tasks)
+        self.assertIn("uuid-105", actuals_updated_tasks)
+
+        # Observation 2 is medium confidence (< 80.0) and routes to review (not auto-linked)
+        self.assertLess(res[2]["confidence_score"], 80.0)
+        self.assertNotIn("uuid-109", actuals_updated_tasks)
+        self.assertNotIn("uuid-110", actuals_updated_tasks)
+        self.assertEqual(len(actuals_updated_tasks), 2)
+
+    def test_scenario_c_one_unmatched_observation_does_not_mutate_schedule(self):
+        """Scenario C: Unmatched observation does not mutate any schedule task."""
+        mock_db = MagicMock()
+        update_row = _make_update_row(
+            raw_update="Foundation reinforcement has been completed at 100%. Catering tent setup completed at dining hall.",
+            location="Compressor Station C",
+        )
+        tasks = [
+            MagicMock(id="uuid-104", source_task_id="MC104", activity="Foundation Reinforcement", location="Compressor Station C", planned_start="2026-09-11", planned_end="2026-09-20", status="not_started"),
+            MagicMock(id="uuid-105", source_task_id="MC105", activity="Equipment Foundation Concrete", location="Compressor Station C", planned_start="2026-09-21", planned_end="2026-09-30", status="not_started"),
+        ]
+
+        actuals_updated_tasks = []
+
+        def make_row(params):
+            r = MagicMock()
+            for k, v in params.items():
+                setattr(r, k, v)
+            r.processed_at = "2026-09-26T10:00:00"
+            r.is_current = True
+            return r
+
+        def db_execute(stmt, params=None):
+            sql = str(stmt)
+            res = MagicMock()
+            if "FROM site_updates" in sql:
+                res.fetchone.return_value = update_row
+            elif "FROM schedule_tasks" in sql:
+                res.fetchall.return_value = tasks
+            elif "UPDATE schedule_tasks" in sql:
+                p = params or {}
+                actuals_updated_tasks.append(p.get("task_id"))
+            elif "INSERT INTO ai_processed_updates" in sql:
+                p = params or {}
+                res.fetchone.return_value = make_row(p)
+            return res
+
+        mock_db.execute.side_effect = db_execute
+
+        res = process_site_update(mock_db, SAMPLE_UPDATE_ID, provider=MockAIProvider())
+
+        self.assertGreaterEqual(len(res), 1)
+        # MC104 auto-linked
+        self.assertIn("uuid-104", actuals_updated_tasks)
+        # No dining/catering task mutated (only uuid-104 touched)
+        self.assertEqual(actuals_updated_tasks, ["uuid-104"])
+
+    def test_scenario_d_repeated_processing_no_duplicate_current_observations(self):
+        """Scenario D: Repeated processing leaves exactly one set of current observations (no duplicates)."""
+        stored_rows: list[dict[str, Any]] = []
+
+        update_row = _make_update_row(
+            raw_update=(
+                "Daily construction update: Foundation reinforcement has been "
+                "completed at 100%. Equipment foundation concrete has reached 60% "
+                "completion and is progressing normally. Equipment base plate "
+                "installation has not started yet."
+            ),
+            location="Compressor Station C",
+        )
+        tasks = [
+            MagicMock(id="uuid-104", source_task_id="MC104", activity="Foundation Reinforcement", location="Compressor Station C", planned_start="2026-09-11", planned_end="2026-09-20", status="not_started"),
+            MagicMock(id="uuid-105", source_task_id="MC105", activity="Equipment Foundation Concrete", location="Compressor Station C", planned_start="2026-09-21", planned_end="2026-09-30", status="not_started"),
+            MagicMock(id="uuid-106", source_task_id="MC106", activity="Equipment Base Plate Installation", location="Compressor Station C", planned_start="2026-10-01", planned_end="2026-10-10", status="not_started"),
+        ]
+
+        def db_execute(stmt, params=None):
+            sql = str(stmt)
+            res = MagicMock()
+            if "FROM site_updates" in sql:
+                res.fetchone.return_value = update_row
+            elif "FROM schedule_tasks" in sql:
+                res.fetchall.return_value = tasks
+            elif "UPDATE ai_processed_updates" in sql and "is_current = false" in sql:
+                p = params or {}
+                for row in stored_rows:
+                    if row["site_update_id"] == p.get("site_update_id"):
+                        row["is_current"] = False
+            elif "INSERT INTO ai_processed_updates" in sql:
+                p = params or {}
+                row_data: dict[str, Any] = dict(p)
+                row_data["is_current"] = True
+                stored_rows.append(row_data)
+                mock_row = MagicMock()
+                for k, v in row_data.items():
+                    setattr(mock_row, str(k), v)
+                mock_row.processed_at = "2026-09-26T10:00:00"
+                res.fetchone.return_value = mock_row
+            return res
+
+        mock_db = MagicMock()
+        mock_db.execute.side_effect = db_execute
+
+        # Run 1
+        res1 = process_site_update(mock_db, SAMPLE_UPDATE_ID, provider=MockAIProvider())
+        self.assertEqual(len(res1), 3)
+        current_run1 = [r for r in stored_rows if r["is_current"]]
+        self.assertEqual(len(current_run1), 3)
+
+        # Run 2 (re-processing)
+        res2 = process_site_update(mock_db, SAMPLE_UPDATE_ID, provider=MockAIProvider())
+        self.assertEqual(len(res2), 3)
+
+        # Total 6 rows in DB (3 historical + 3 current)
+        self.assertEqual(len(stored_rows), 6)
+
+        # Exactly 3 current rows
+        current_run2 = [r for r in stored_rows if r["is_current"]]
+        self.assertEqual(len(current_run2), 3)
+        self.assertEqual([r["observation_index"] for r in current_run2], [0, 1, 2])
+
+        # Exactly 3 historical rows
+        historical = [r for r in stored_rows if not r["is_current"]]
+        self.assertEqual(len(historical), 3)
+        self.assertEqual([r["observation_index"] for r in historical], [0, 1, 2])
+
 
 if __name__ == "__main__":
     unittest.main()

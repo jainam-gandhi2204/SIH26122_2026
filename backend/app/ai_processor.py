@@ -69,6 +69,55 @@ PLANNER_REVIEW_MIN_THRESHOLD: float = 50.0
 
 
 # ---------------------------------------------------------------------------
+# ObservationList wrapper for backward compatibility
+# ---------------------------------------------------------------------------
+
+class ObservationList(list):
+    """List of observation dicts providing backwards-compatible dict access.
+
+    Phase 1 callers and tests access the primary observation via dict keys, e.g.
+    `result["matched_task_id"]` or `result.get("status")`.
+    Phase 2 callers iterate over all observations or access by integer index.
+    Dict-style operations are delegated to self[0] if the list is non-empty.
+    """
+
+    def __getitem__(self, key: Any) -> Any:
+        if isinstance(key, str):
+            if not self:
+                raise KeyError(key)
+            return self[0][key]
+        return super().__getitem__(key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if not self:
+            return default
+        return self[0].get(key, default)
+
+    def __contains__(self, key: Any) -> bool:
+        if isinstance(key, str):
+            if not self:
+                return False
+            return key in self[0]
+        return super().__contains__(key)
+
+    def keys(self) -> Any:
+        if not self:
+            return iter(())
+        return self[0].keys()
+
+    def values(self) -> Any:
+        if not self:
+            return iter(())
+        return self[0].values()
+
+    def items(self) -> Any:
+        if not self:
+            return iter(())
+        return self[0].items()
+
+
+
+# ---------------------------------------------------------------------------
 # SQL queries
 # ---------------------------------------------------------------------------
 
@@ -582,7 +631,7 @@ def process_site_update(
             # Continue — remaining observations are unaffected.
 
     db.commit()
-    return inserted_rows
+    return ObservationList(inserted_rows)
 
 
 def _process_secondary_obs(
@@ -607,8 +656,6 @@ def _process_secondary_obs(
     matched_uuid: str | None = task_id_map.get(candidate_id or "") if candidate_id else None
 
     # Compute composite confidence for this observation.
-    # We use extraction_confidence as both LLM extraction and match signals
-    # (mock provider doesn't separate them for secondary observations).
     det_score = 0.0
     loc_score = 0
     if candidate_id and matched_uuid:
@@ -616,7 +663,8 @@ def _process_secondary_obs(
             (t for t in candidate_tasks if t["source_task_id"] == candidate_id), None
         )
         if matched_task:
-            norm_raw = normalize_with_aliases(raw_update, _ALL_ALIAS_PAIRS)
+            scoring_text = obs.activity_description or raw_update
+            norm_raw = normalize_with_aliases(scoring_text, _ALL_ALIAS_PAIRS)
             det_score = score_candidate_task(matched_task, norm_raw, location)
             loc_score = _location_match_score(
                 matched_task.get("location", "").lower(),
@@ -624,12 +672,19 @@ def _process_secondary_obs(
                 raw_update.lower(),
             )
 
+    llm_match_conf = getattr(obs, "match_confidence", None)
+    if llm_match_conf is None:
+        llm_match_conf = obs.extraction_confidence
+
     obs_confidence = compute_composite_confidence(
-        llm_confidence=obs.extraction_confidence,
+        llm_confidence=llm_match_conf,
         llm_extraction_confidence=obs.extraction_confidence,
         deterministic_score=det_score,
         location_match_score=loc_score,
     )
+
+    if getattr(obs, "is_ambiguous", False):
+        obs_confidence = min(obs_confidence, 60.0)
 
     # Apply tier thresholds (same rules as primary)
     if obs_confidence < PLANNER_REVIEW_MIN_THRESHOLD:
@@ -642,9 +697,12 @@ def _process_secondary_obs(
         "activity_description": obs.activity_description,
         "candidate_source_task_id": candidate_id,
         "extraction_confidence": obs.extraction_confidence,
+        "match_confidence": llm_match_conf,
         "deterministic_score": det_score,
         "location_match_score": loc_score,
         "composite_confidence": obs_confidence,
+        "is_ambiguous": getattr(obs, "is_ambiguous", False),
+        "reasoning": getattr(obs, "reasoning", None),
     }
 
     params: dict[str, Any] = {
@@ -655,8 +713,8 @@ def _process_secondary_obs(
         "status": obs.status,
         "delay_days": obs.delay_days,
         "delay_reason": obs.delay_reason,
-        "actual_start_date": None,
-        "actual_end_date": None,
+        "actual_start_date": getattr(obs, "actual_start_date", None),
+        "actual_end_date": getattr(obs, "actual_end_date", None),
         "confidence_score": obs_confidence,
         "model_name": model_name,
         "model_response": json.dumps(obs_model_response),
@@ -692,7 +750,7 @@ def _maybe_auto_link(
         if eff_status == "completed" or (eff_progress is not None and eff_progress >= 100.0):
             eff_status = "completed"
             eff_progress = 100.0
-            if eff_end is None:
+            if eff_end is None and reported_on_str:
                 eff_end = reported_on_str
             if eff_delay is None:
                 eff_delay = 0
@@ -713,10 +771,13 @@ def _maybe_auto_link(
         eff_status = obs.status
         eff_progress = obs.progress_percent
         eff_delay = obs.delay_days
+        eff_end = getattr(obs, "actual_end_date", None)
 
         if eff_status == "completed" or (eff_progress is not None and eff_progress >= 100.0):
             eff_status = "completed"
             eff_progress = 100.0
+            if eff_end is None and reported_on_str:
+                eff_end = reported_on_str
             if eff_delay is None:
                 eff_delay = 0
 
@@ -728,8 +789,8 @@ def _maybe_auto_link(
             status=eff_status,
             delay_days=eff_delay,
             delay_reason=obs.delay_reason,
-            actual_start_date=None,
-            actual_end_date=None,
+            actual_start_date=getattr(obs, "actual_start_date", None),
+            actual_end_date=eff_end,
         )
 
 def update_schedule_task_actuals(
@@ -789,12 +850,24 @@ def update_schedule_task_actuals(
 def get_current_result(
     db: Session,
     update_id: str,
-) -> list[dict[str, Any]]:
+) -> ObservationList | None:
     """Return all current AI-processed observations for a site update.
 
-    Phase 2: Returns a list ordered by observation_index.
+    Phase 2: Returns an ObservationList ordered by observation_index.
     Primary observation is always first (index 0).
-    Returns empty list if no current result exists.
+    ObservationList supports backwards-compatible dict access for Phase 1.
+    Returns None if no current result exists.
     """
-    rows = db.execute(_FETCH_CURRENT_RESULT, {"site_update_id": update_id}).fetchall()
-    return [_format_result(row) for row in rows]
+    res = db.execute(_FETCH_CURRENT_RESULT, {"site_update_id": update_id})
+    rows: list[Any] = []
+    if hasattr(res, "fetchall"):
+        val = res.fetchall()
+        if isinstance(val, (list, tuple)):
+            rows = list(val)
+    if not rows and hasattr(res, "fetchone"):
+        single = res.fetchone()
+        if single is not None:
+            rows = [single]
+    if not rows:
+        return None
+    return ObservationList([_format_result(row) for row in rows])

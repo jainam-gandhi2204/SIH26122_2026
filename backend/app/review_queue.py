@@ -36,6 +36,7 @@ from app.ai_processor import (
     AUTO_LINK_CONFIDENCE_THRESHOLD,
     update_schedule_task_actuals,
 )
+from app.ai_provider import score_candidate_task
 
 DEFAULT_CONFIDENCE_THRESHOLD: float = AUTO_LINK_CONFIDENCE_THRESHOLD
 
@@ -82,6 +83,7 @@ _REVIEW_QUEUE_QUERY = text(
         ap.model_name,
         ap.model_response,
         ap.processed_at::TEXT      AS processed_at,
+        ap.observation_index,
         st.id                      AS matched_st_id,
         st.source_task_id          AS matched_source_task_id,
         st.activity                AS matched_activity,
@@ -133,6 +135,7 @@ _FETCH_REVIEW_ITEM_QUERY = text(
         ap.model_name,
         ap.model_response,
         ap.processed_at::TEXT      AS processed_at,
+        ap.observation_index,
         ap.is_current,
         st.id                      AS matched_st_id,
         st.source_task_id          AS matched_source_task_id,
@@ -235,21 +238,23 @@ def _find_suggested_match(
             if t.get("source_task_id", "").upper() == suggested_clean:
                 return dict(t)
 
-    # 3. Fallback heuristic: keyword matching for tasks at same location
-    raw_lower = raw_update.lower()
+    # 3. Fallback heuristic: score candidate tasks using deterministic scoring
     loc_clean = location.strip().lower()
     loc_candidates = [
         t for t in all_tasks
         if t.get("location", "").strip().lower() == loc_clean
     ]
+    pool = loc_candidates if loc_candidates else all_tasks
+    best_candidate: dict[str, Any] | None = None
+    best_score = 0.0
+    for t in pool:
+        score = score_candidate_task(t, raw_update, location)
+        if score > best_score:
+            best_score = score
+            best_candidate = t
 
-    for t in loc_candidates:
-        act_words = [
-            w for w in re.findall(r"\w+", t.get("activity", "").lower())
-            if len(w) > 3
-        ]
-        if any(w in raw_lower for w in act_words):
-            return dict(t)
+    if best_candidate and best_score >= 50.0:
+        return dict(best_candidate)
 
     return None
 
@@ -293,12 +298,14 @@ def _extract_activity_name(
 ) -> str | None:
     """Extract a descriptive activity name from model output or suggested task."""
     if isinstance(model_resp, dict):
-        act = model_resp.get("activity")
+        act = model_resp.get("activity_description") or model_resp.get("activity")
         if act:
             return str(act)
         raw_json = model_resp.get("raw_json")
-        if isinstance(raw_json, dict) and raw_json.get("activity"):
-            return str(raw_json["activity"])
+        if isinstance(raw_json, dict):
+            raw_act = raw_json.get("activity_description") or raw_json.get("activity")
+            if raw_act:
+                return str(raw_act)
 
     if suggested_match and suggested_match.get("activity"):
         return str(suggested_match["activity"])
@@ -456,6 +463,7 @@ def get_review_queue(
         items.append({
             "review_id": str(r.processed_id),
             "site_update_id": str(r.site_update_id),
+            "observation_index": getattr(r, "observation_index", 0),
             "source_update_id": r.source_update_id,
             "reported_on": str(r.reported_on) if r.reported_on else None,
             "location": r.location,

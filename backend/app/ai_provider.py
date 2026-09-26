@@ -179,13 +179,19 @@ class ActivityObservation:
     Phase 2: Each observation can be persisted as a separate DB row.
     """
     activity_description: str           # What the update says about this activity
-    location_mentioned: str | None      # Location as mentioned (may be alias)
-    progress_percent: float | None      # Extracted progress (FACT only)
-    status: str | None                  # Extracted status (INFERENCE ok)
-    delay_days: int | None              # Delay in days (FACT only)
-    delay_reason: str | None            # Delay reason (INFERENCE ok)
-    extraction_confidence: float        # How clearly this observation was stated (0–100)
-    candidate_source_task_id: str | None  # Best candidate task for this observation
+    location_mentioned: str | None = None      # Location as mentioned (may be alias)
+    progress_percent: float | None = None      # Extracted progress (FACT only)
+    status: str | None = None                  # Extracted status (INFERENCE ok)
+    delay_days: int | None = None              # Delay in days (FACT only)
+    delay_reason: str | None = None            # Delay reason (INFERENCE ok)
+    extraction_confidence: float = 75.0        # How clearly this observation was stated (0–100)
+    candidate_source_task_id: str | None = None  # Best candidate task for this observation
+    actual_start_date: str | None = None       # Start date if explicitly stated (FACT only)
+    actual_end_date: str | None = None         # End date if explicitly stated (FACT only)
+    match_confidence: float | None = None      # Task matching confidence (0–100)
+    is_ambiguous: bool = False                 # Ambiguity flag for this observation
+    reasoning: str | None = None               # Audit reasoning for this observation
+
 
 
 @dataclass
@@ -669,20 +675,35 @@ def evaluate_task_matches(
             },
         )
 
-    scored: list[tuple[float, dict[str, Any]]] = []
+    norm_raw = normalize_with_aliases(raw_update, _ALL_ALIAS_PAIRS)
+    raw_lower = norm_raw.lower()
+
+    scored: list[tuple[float, bool, dict[str, Any]]] = []
     for t in candidate_tasks:
         score = score_candidate_task(t, raw_update, location)
-        scored.append((score, t))
+        task_act = normalize_with_aliases(str(t.get("activity", "")), _ALL_ALIAS_PAIRS).strip().lower()
+        act_words = [w for w in re.findall(r"\w+", task_act) if len(w) > 2]
+        distinctive = [w for w in act_words if w not in _STOP_WORDS] or act_words
+        clean_phrase = " ".join(distinctive)
+        exact = bool(task_act and (task_act in raw_lower or clean_phrase in raw_lower))
+        scored.append((score, exact, t))
 
-    # Sort descending by score, then planned_start
-    scored.sort(key=lambda x: (-x[0], x[1].get("planned_start") or ""))
-    top_score, top_task = scored[0]
+    # Sort descending by score, exact match preference, planned_start
+    scored.sort(key=lambda x: (-x[0], not x[1], x[2].get("planned_start") or ""))
+    top_score, top_exact, top_task = scored[0]
 
-    if top_score >= 80.0:
+    if top_score >= 50.0:
         # Check ambiguity against second candidate
         if len(scored) > 1:
-            second_score, second_task = scored[1]
-            if second_score >= 55.0 and (top_score - second_score < 20.0):
+            second_score, second_exact, second_task = scored[1]
+            top_act = normalize_with_aliases(str(top_task.get("activity", "")), _ALL_ALIAS_PAIRS).strip().lower()
+            sec_act = normalize_with_aliases(str(second_task.get("activity", "")), _ALL_ALIAS_PAIRS).strip().lower()
+            top_words = set([w for w in re.findall(r"\w+", top_act) if len(w) > 2 and w not in _STOP_WORDS])
+            sec_words = set([w for w in re.findall(r"\w+", sec_act) if len(w) > 2 and w not in _STOP_WORDS])
+
+            # A candidate whose tokens are a subset of top_task or top_task is exact and second is not, is subsumed
+            is_subsumed = (bool(sec_words) and sec_words.issubset(top_words)) or (top_exact and not second_exact)
+            if second_score >= 55.0 and (top_score - second_score < 20.0) and not is_subsumed:
                 # Competing candidates → Medium tier (ambiguous match for planner review)
                 return (
                     top_task["id"],
@@ -699,22 +720,23 @@ def evaluate_task_matches(
                         ),
                     },
                 )
-        # Unambiguous high confidence match
-        return (
-            top_task["id"],
-            top_score,
-            {
-                "confidence_tier": "high",
-                "matched_source_task_id": top_task.get("source_task_id"),
-                "is_ambiguous": False,
-                "reasoning": (
-                    f"High-confidence match to {top_task.get('source_task_id')} "
-                    f"({top_task.get('activity')}) with {top_score:.1f}% score."
-                ),
-            },
-        )
 
-    if top_score >= 50.0:
+        if top_score >= 80.0:
+            # Unambiguous high confidence match
+            return (
+                top_task["id"],
+                top_score,
+                {
+                    "confidence_tier": "high",
+                    "matched_source_task_id": top_task.get("source_task_id"),
+                    "is_ambiguous": False,
+                    "reasoning": (
+                        f"High-confidence match to {top_task.get('source_task_id')} "
+                        f"({top_task.get('activity')}) with {top_score:.1f}% score."
+                    ),
+                },
+            )
+
         # Medium confidence match → Planner review
         return (
             top_task["id"],
@@ -760,6 +782,152 @@ def evaluate_task_matches(
     )
 
 
+def _has_activity_keyword_match(task: dict[str, Any], text: str) -> bool:
+    """Check if text contains any distinctive activity keyword from the task."""
+    task_act = normalize_with_aliases(str(task.get("activity", "")), _ALL_ALIAS_PAIRS).strip().lower()
+    act_words = [w for w in re.findall(r"\w+", task_act) if len(w) > 2]
+    distinctive = [w for w in act_words if w not in _STOP_WORDS] or act_words
+    clean_phrase = " ".join(distinctive)
+    text_lower = text.lower()
+    if clean_phrase in text_lower or task_act in text_lower:
+        return True
+    for w in distinctive:
+        if re.search(r"\b" + re.escape(w) + r"\b", text_lower):
+            return True
+        for root, syns in _ACTIVITY_SYNONYMS.items():
+            if w.startswith(root) or any(s in w for s in syns):
+                if any(re.search(r"\b" + re.escape(s) + r"\b", text_lower) for s in syns):
+                    return True
+    return False
+
+
+def _split_into_activity_clauses(text: str) -> list[str]:
+    """Split raw update text into distinct clauses or sentences."""
+    if not text:
+        return []
+    # Split by major sentence delimiters: newlines, periods, exclamation/question marks, semicolons
+    # (?<!\d)[.!?;\n]+(?!\d) avoids splitting on decimals (e.g. 60.5%) or dates (e.g. 2026.09.21)
+    parts = [s.strip() for s in re.split(r"(?<!\d)[.!?;\n]+(?!\d)", text) if s.strip()]
+    return parts
+
+
+def _parse_activity_clause(
+    clause: str,
+    location: str,
+    candidate_tasks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Parse a single activity clause or sentence into an observation dict."""
+    norm_clause = normalize_with_aliases(clause, _ALL_ALIAS_PAIRS)
+    c_lower = norm_clause.lower()
+    matched_id, raw_conf, meta = evaluate_task_matches(candidate_tasks, norm_clause, location)
+
+    if matched_id:
+        matched_t = next((x for x in candidate_tasks if x["id"] == matched_id), None)
+        if matched_t and not _has_activity_keyword_match(matched_t, norm_clause):
+            # Clause matched on location/date only without mentioning activity keywords
+            matched_id = None
+            meta["matched_source_task_id"] = None
+            meta["confidence_tier"] = "low"
+            raw_conf = 25.0
+
+    pct_m = re.search(r"(\d+(?:\.\d+)?)\s*%", clause)
+    has_explicit_pct = pct_m is not None
+    progress: float | None = None
+    if has_explicit_pct and pct_m:
+        candidate_pct = float(pct_m.group(1))
+        if 0.0 <= candidate_pct <= 100.0:
+            progress = candidate_pct
+
+    status: str | None = None
+    for kw, mapped in _STATUS_KEYWORDS.items():
+        if kw in c_lower:
+            status = mapped
+            break
+
+    if progress is None and status == "completed":
+        progress = 100.0
+    if progress is not None and progress < 100.0 and status == "completed":
+        status = "in_progress"
+
+    delay_days = _extract_delay_days(clause)
+    delay_reason: str | None = None
+    if delay_days is not None and delay_days > 0:
+        if progress is None or progress < 100.0:
+            status = "delayed"
+    elif "delay" in c_lower or "behind" in c_lower:
+        if progress is None or progress < 100.0:
+            status = "delayed"
+
+    if status in ("delayed", "blocked"):
+        for kw in ("delay", "behind", "block", "halt", "stopp", "rainfall", "rain", "weather", "breakdown"):
+            if kw in c_lower:
+                delay_reason = clause.strip()
+                break
+
+    start_d = _extract_start_date(clause)
+    end_d = _extract_end_date(clause)
+
+    has_stat_kw = status is not None
+    has_cands = len(candidate_tasks) > 0
+    if not has_cands:
+        ext_conf = 15.0
+    elif has_explicit_pct and has_stat_kw:
+        ext_conf = 95.0
+    elif has_explicit_pct or has_stat_kw:
+        ext_conf = 85.0
+    elif len(clause.strip()) < 20:
+        ext_conf = 40.0
+    else:
+        ext_conf = 70.0
+
+    loc_score = 0
+    if matched_id:
+        t = next((x for x in candidate_tasks if x["id"] == matched_id), None)
+        if t:
+            loc_score = _location_match_score(
+                t.get("location", "").lower(),
+                location.lower(),
+                clause.lower(),
+            )
+
+    comp_conf = compute_composite_confidence(
+        llm_confidence=raw_conf,
+        llm_extraction_confidence=ext_conf,
+        deterministic_score=raw_conf,
+        location_match_score=loc_score,
+    )
+    if meta.get("is_ambiguous"):
+        comp_conf = min(comp_conf, 60.0)
+
+    is_ambiguous = meta.get("is_ambiguous", False)
+    tier = meta.get("confidence_tier", "low")
+    matched_src = meta.get("matched_source_task_id")
+
+    if comp_conf < 50.0:
+        matched_id = None
+        matched_src = None
+        tier = "low"
+
+    return {
+        "clause_text": clause,
+        "matched_task_id": matched_id,
+        "matched_source_task_id": matched_src,
+        "progress_percent": progress,
+        "status": status,
+        "delay_days": delay_days,
+        "delay_reason": delay_reason,
+        "actual_start_date": start_d,
+        "actual_end_date": end_d,
+        "confidence_score": comp_conf,
+        "match_confidence": raw_conf,
+        "extraction_confidence": ext_conf,
+        "is_ambiguous": is_ambiguous,
+        "confidence_tier": tier,
+        "reasoning": meta.get("reasoning", ""),
+        "location_match_score": loc_score,
+    }
+
+
 class MockAIProvider(AIProvider):
     """Deterministic keyword and activity-similarity analyser used when no real API is configured.
 
@@ -779,6 +947,93 @@ class MockAIProvider(AIProvider):
         reported_on: str,
         candidate_tasks: list[dict[str, Any]],
     ) -> AnalysisResult:
+        # Check if update contains multiple distinct activity clauses / sentences
+        clauses = _split_into_activity_clauses(raw_update)
+        tasks_with_activity_match = [
+            t["id"] for t in candidate_tasks
+            if _has_activity_keyword_match(t, raw_update)
+        ]
+
+        if len(clauses) > 1 and len(tasks_with_activity_match) >= 2:
+            parsed_clauses = [
+                _parse_activity_clause(c, location, candidate_tasks)
+                for c in clauses
+            ]
+            activity_clauses = [
+                p for p in parsed_clauses
+                if p["matched_task_id"] is not None
+                or p["progress_percent"] is not None
+                or (p["status"] is not None and len(p["clause_text"]) > 10)
+            ]
+            matched_tasks = [p["matched_task_id"] for p in activity_clauses if p["matched_task_id"] is not None]
+            unique_tasks = set(matched_tasks)
+
+            if len(unique_tasks) >= 2 or len(activity_clauses) >= 2:
+                p0 = activity_clauses[0]
+                additional_obs: list[ActivityObservation] = []
+                for p in activity_clauses[1:]:
+                    obs = ActivityObservation(
+                        activity_description=p["clause_text"],
+                        location_mentioned=location,
+                        progress_percent=p["progress_percent"],
+                        status=p["status"],
+                        delay_days=p["delay_days"],
+                        delay_reason=p["delay_reason"],
+                        extraction_confidence=p["extraction_confidence"],
+                        candidate_source_task_id=p["matched_source_task_id"],
+                        actual_start_date=p["actual_start_date"],
+                        actual_end_date=p["actual_end_date"],
+                        match_confidence=p["match_confidence"],
+                        is_ambiguous=p["is_ambiguous"],
+                        reasoning=p["reasoning"],
+                    )
+                    additional_obs.append(obs)
+
+                raw_add_obs = [
+                    {
+                        "candidate_source_task_id": o.candidate_source_task_id,
+                        "activity": o.activity_description,
+                        "location": o.location_mentioned,
+                        "keyword_score": o.match_confidence,
+                        "progress_percent": o.progress_percent,
+                        "status": o.status,
+                        "extraction_confidence": o.extraction_confidence,
+                        "match_confidence": o.match_confidence,
+                        "is_ambiguous": o.is_ambiguous,
+                        "reasoning": o.reasoning,
+                    }
+                    for o in additional_obs
+                ]
+
+                model_response: dict[str, Any] = {
+                    "provider": _MOCK_MODEL_NAME,
+                    "text_analysed": raw_update[:500],
+                    "matched_source_task_id": p0["matched_source_task_id"],
+                    "confidence_tier": p0["confidence_tier"],
+                    "is_ambiguous": p0["is_ambiguous"],
+                    "reasoning": p0["reasoning"],
+                    "extraction_confidence": p0["extraction_confidence"],
+                    "match_confidence": p0["match_confidence"],
+                    "composite_confidence": p0["confidence_score"],
+                    "location_match_score": p0["location_match_score"],
+                    "additional_observations": raw_add_obs,
+                    "note": "Deterministic multi-activity clause matching and confidence tiering.",
+                }
+
+                return AnalysisResult(
+                    matched_task_id=p0["matched_task_id"],
+                    progress_percent=p0["progress_percent"],
+                    status=p0["status"],
+                    delay_days=p0["delay_days"],
+                    delay_reason=p0["delay_reason"],
+                    actual_start_date=p0["actual_start_date"],
+                    actual_end_date=p0["actual_end_date"],
+                    confidence_score=p0["confidence_score"],
+                    model_name=_MOCK_MODEL_NAME,
+                    model_response=model_response,
+                    additional_observations=additional_obs,
+                )
+
         # Normalize the raw update text with both activity and location aliases
         norm_update = normalize_with_aliases(raw_update, _ALL_ALIAS_PAIRS)
         text_lower = norm_update.lower()
@@ -962,8 +1217,16 @@ def _detect_additional_activities(
 
     # Sort and skip the top (primary) match; return the rest as observations
     scored.sort(key=lambda x: -x[0])
+    top_task = scored[0][1]
+    top_act = normalize_with_aliases(str(top_task.get("activity", "")), _ALL_ALIAS_PAIRS).strip().lower()
+    top_words = set([w for w in re.findall(r"\w+", top_act) if len(w) > 2 and w not in _STOP_WORDS])
+
     additional: list[dict[str, Any]] = []
     for score, task in scored[1:]:
+        sec_act = normalize_with_aliases(str(task.get("activity", "")), _ALL_ALIAS_PAIRS).strip().lower()
+        sec_words = set([w for w in re.findall(r"\w+", sec_act) if len(w) > 2 and w not in _STOP_WORDS])
+        if sec_words and sec_words.issubset(top_words):
+            continue
         # Check for progress in raw_update (simple scan)
         pct_m = re.search(r"(\d+(?:\.\d+)?)\s*%", raw_update)
         obs: dict[str, Any] = {
@@ -1016,6 +1279,14 @@ def _dicts_to_activity_observations(
         ext_conf = max(0.0, min(100.0, float(ext_conf_raw)))
         loc = _safe_str(d.get("location") or d.get("location_mentioned"))
 
+        start_d = _safe_iso_date(d.get("actual_start_date"))
+        end_d = _safe_iso_date(d.get("actual_end_date"))
+        match_c = _safe_float(d.get("match_confidence"))
+        if match_c is not None:
+            match_c = max(0.0, min(100.0, match_c))
+        is_amb = bool(d.get("is_ambiguous", False))
+        reas = _safe_str(d.get("reasoning"))
+
         result.append(
             ActivityObservation(
                 activity_description=activity_desc,
@@ -1026,6 +1297,11 @@ def _dicts_to_activity_observations(
                 delay_reason=delay_r,
                 extraction_confidence=ext_conf,
                 candidate_source_task_id=candidate_id,
+                actual_start_date=start_d,
+                actual_end_date=end_d,
+                match_confidence=match_c,
+                is_ambiguous=is_amb,
+                reasoning=reas,
             )
         )
     return result
@@ -1058,7 +1334,7 @@ def get_provider() -> AIProvider:
 # Gemini provider
 # ---------------------------------------------------------------------------
 
-_GEMINI_MODEL = "gemini-3.6-flash"
+_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
 _SYSTEM_PROMPT = """\
 You are an expert construction-project analyst specialising in oil & gas pipeline, well pad, and compressor station projects.
@@ -1139,13 +1415,19 @@ Return a single JSON object with ALL of the following fields:
 
 - additional_observations (array or null):
     If the update mentions more than one distinct schedule activity, list the additional
-    observations here (beyond the primary matched one). For each additional activity:
+    observations here (beyond the primary matched one).
+    The FIRST mentioned activity in the update MUST be the primary match above;
+    any subsequent activities mentioned in the text are listed here in order.
+    For each additional activity:
     {
-        "candidate_source_task_id": "...",  // best candidate, or null
-        "activity_description": "...",       // what the update says about this activity
-        "progress_percent": <number or null>,
-        "status": <string or null>,
-        "extraction_confidence": <number>
+        "candidate_source_task_id": "...",  // best candidate task ID, or null if unmatched
+        "activity_description": "...",       // exact phrase or clause from the update
+        "progress_percent": <number 0-100 or null>,
+        "status": <string or null>,         // "not_started", "in_progress", "completed", "delayed", "blocked"
+        "actual_start_date": <string "YYYY-MM-DD" or null>,
+        "actual_end_date": <string "YYYY-MM-DD" or null>,
+        "extraction_confidence": <number 0-100>,
+        "match_confidence": <number 0-100>
     }
     Set to null or empty array if only one activity is discussed.
 
