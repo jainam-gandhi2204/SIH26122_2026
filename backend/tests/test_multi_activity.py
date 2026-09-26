@@ -1220,6 +1220,451 @@ class MultiActivityProcessingTests(unittest.TestCase):
         self.assertEqual(len(historical), 3)
         self.assertEqual([r["observation_index"] for r in historical], [0, 1, 2])
 
+    def test_generalization_pipeline_section_x_all_seven_activities_auto_linked(self):
+        """Test A: Pipeline Section X report with 7 activities all auto-link (>80%) independently.
+
+        Verifies:
+        1. Route survey and marking -> 100% completed on 2026-11-07, matches PX101
+        2. Right of way clearing -> 100% completed on 2026-11-11, matches PX102
+        3. Trench excavation -> 100% completed on 2026-11-17, matches PX103
+        4. Sand bedding -> 80% in_progress, matches PX104
+        5. Pipe stringing -> 100% completed, matches PX105
+        6. Pipeline welding -> 35% in_progress, delay_days=1, delay_reason='heavy rainfall', matches PX106
+        7. Weld inspection and NDT -> not_started, progress is None, matches PX107
+        All 7 have composite confidence >= 80.0 and update schedule_tasks actuals.
+        """
+        raw_update = (
+            "Daily pipeline construction report: Route survey and marking was "
+            "completed on 7 November. Right of way clearing was completed on "
+            "11 November. Trench excavation reached 100% completion on 17 November. "
+            "Sand bedding is currently 80% complete and progressing normally. "
+            "Pipe stringing has been completed. Pipeline welding has started and "
+            "is approximately 35% complete. Welding activities were delayed by "
+            "heavy rainfall for one working day. Weld inspection and NDT has not "
+            "started yet because welding is still in progress."
+        )
+        update_row = _make_update_row(raw_update=raw_update, location="Pipeline Section X", reported_on=datetime.date(2026, 11, 18))
+        tasks = [
+            MagicMock(id="u-px101", source_task_id="PX101", activity="Route Survey and Marking", location="Pipeline Section X", planned_start="2026-11-01", planned_end="2026-11-10", status="not_started"),
+            MagicMock(id="u-px102", source_task_id="PX102", activity="Right of Way Clearing", location="Pipeline Section X", planned_start="2026-11-05", planned_end="2026-11-15", status="not_started"),
+            MagicMock(id="u-px103", source_task_id="PX103", activity="Trench Excavation", location="Pipeline Section X", planned_start="2026-11-10", planned_end="2026-11-20", status="not_started"),
+            MagicMock(id="u-px104", source_task_id="PX104", activity="Sand Bedding", location="Pipeline Section X", planned_start="2026-11-15", planned_end="2026-11-25", status="not_started"),
+            MagicMock(id="u-px105", source_task_id="PX105", activity="Pipe Stringing", location="Pipeline Section X", planned_start="2026-11-20", planned_end="2026-11-30", status="not_started"),
+            MagicMock(id="u-px106", source_task_id="PX106", activity="Pipeline Welding", location="Pipeline Section X", planned_start="2026-11-25", planned_end="2026-12-05", status="not_started"),
+            MagicMock(id="u-px107", source_task_id="PX107", activity="Weld Inspection and NDT", location="Pipeline Section X", planned_start="2026-12-01", planned_end="2026-12-10", status="not_started"),
+        ]
+
+        actuals_updated_tasks: list[str] = []
+        def make_row(params):
+            r = MagicMock()
+            for k, v in params.items():
+                setattr(r, k, v)
+            r.processed_at = "2026-11-18T10:00:00"
+            r.is_current = True
+            return r
+
+        def db_execute(stmt, params=None):
+            sql = str(stmt)
+            res = MagicMock()
+            if "FROM site_updates" in sql:
+                res.fetchone.return_value = update_row
+            elif "FROM schedule_tasks" in sql:
+                res.fetchall.return_value = tasks
+            elif "UPDATE schedule_tasks" in sql:
+                p = params or {}
+                actuals_updated_tasks.append(p.get("task_id"))
+            elif "INSERT INTO ai_processed_updates" in sql:
+                p = params or {}
+                res.fetchone.return_value = make_row(p)
+            return res
+
+        mock_db = MagicMock()
+        mock_db.execute.side_effect = db_execute
+
+        res = process_site_update(mock_db, SAMPLE_UPDATE_ID, provider=MockAIProvider())
+
+        self.assertEqual(len(res), 7)
+        # Verify all 7 observations received indexes 0..6
+        self.assertEqual([obs["observation_index"] for obs in res], list(range(7)))
+
+        # Verify all 7 observations have confidence >= 80.0
+        for i, obs in enumerate(res):
+            self.assertGreaterEqual(
+                obs["confidence_score"],
+                80.0,
+                f"Observation {i} ({obs.get('activity_description')}) did not reach 80% threshold",
+            )
+
+        # 1. Route Survey and Marking -> PX101
+        self.assertEqual(res[0]["matched_task_id"], "u-px101")
+        self.assertEqual(res[0]["progress_percent"], 100.0)
+        self.assertEqual(res[0]["status"], "completed")
+        self.assertEqual(res[0]["actual_end_date"], "2026-11-07")
+
+        # 2. Right of Way Clearing -> PX102
+        self.assertEqual(res[1]["matched_task_id"], "u-px102")
+        self.assertEqual(res[1]["progress_percent"], 100.0)
+        self.assertEqual(res[1]["status"], "completed")
+        self.assertEqual(res[1]["actual_end_date"], "2026-11-11")
+
+        # 3. Trench Excavation -> PX103
+        self.assertEqual(res[2]["matched_task_id"], "u-px103")
+        self.assertEqual(res[2]["progress_percent"], 100.0)
+        self.assertEqual(res[2]["status"], "completed")
+        self.assertEqual(res[2]["actual_end_date"], "2026-11-17")
+
+        # 4. Sand Bedding -> PX104
+        self.assertEqual(res[3]["matched_task_id"], "u-px104")
+        self.assertEqual(res[3]["progress_percent"], 80.0)
+        self.assertEqual(res[3]["status"], "in_progress")
+
+        # 5. Pipe Stringing -> PX105
+        self.assertEqual(res[4]["matched_task_id"], "u-px105")
+        self.assertEqual(res[4]["progress_percent"], 100.0)
+        self.assertEqual(res[4]["status"], "completed")
+
+        # 6. Pipeline Welding -> PX106
+        self.assertEqual(res[5]["matched_task_id"], "u-px106")
+        self.assertEqual(res[5]["progress_percent"], 35.0)
+        self.assertEqual(res[5]["status"], "in_progress")
+        self.assertEqual(res[5]["delay_days"], 1)
+        self.assertIsNotNone(res[5]["delay_reason"])
+        self.assertIn("heavy rainfall", res[5]["delay_reason"].lower())
+
+        # 7. Weld Inspection and NDT -> PX107
+        self.assertEqual(res[6]["matched_task_id"], "u-px107")
+        self.assertIsNone(res[6]["progress_percent"])
+        self.assertEqual(res[6]["status"], "not_started")
+
+        # Verify all 7 tasks had actuals updated in schedule
+        self.assertEqual(
+            actuals_updated_tasks,
+            ["u-px101", "u-px102", "u-px103", "u-px104", "u-px105", "u-px106", "u-px107"],
+        )
+
+    def test_generalization_pipeline_section_x_alternative_wording_report_b(self):
+        """Test B: Same 7 activities with alternative phrasing all extract and match correctly."""
+        raw_update_b = (
+            "Daily field summary: Route survey and line marking was finished on 7 Nov. "
+            "ROW clearing was completed on 11 Nov. "
+            "Trenching reached 100% completion on 17 Nov. "
+            "Sand bedding is 80% complete and continuing. "
+            "Pipe stringing work is done. "
+            "Pipeline welding has commenced and is around 35% complete with 1 day delay due to heavy rainfall. "
+            "Inspection and NDT has not started yet."
+        )
+        tasks = [
+            {"id": "u-px101", "source_task_id": "PX101", "activity": "Route Survey and Marking", "location": "Pipeline Section X"},
+            {"id": "u-px102", "source_task_id": "PX102", "activity": "Right of Way Clearing", "location": "Pipeline Section X"},
+            {"id": "u-px103", "source_task_id": "PX103", "activity": "Trench Excavation", "location": "Pipeline Section X"},
+            {"id": "u-px104", "source_task_id": "PX104", "activity": "Sand Bedding", "location": "Pipeline Section X"},
+            {"id": "u-px105", "source_task_id": "PX105", "activity": "Pipe Stringing", "location": "Pipeline Section X"},
+            {"id": "u-px106", "source_task_id": "PX106", "activity": "Pipeline Welding", "location": "Pipeline Section X"},
+            {"id": "u-px107", "source_task_id": "PX107", "activity": "Weld Inspection and NDT", "location": "Pipeline Section X"},
+        ]
+
+        provider = MockAIProvider()
+        result = provider.analyse(
+            raw_update=raw_update_b,
+            location="Pipeline Section X",
+            reported_on="2026-11-18",
+            candidate_tasks=tasks,
+        )
+
+        all_obs = [result] + list(result.additional_observations)
+        self.assertEqual(len(all_obs), 7)
+
+        # Verify task mappings
+        matched_source_ids = [
+            result.matched_task_id,  # "u-px101"
+            *[obs.candidate_source_task_id for obs in result.additional_observations],
+        ]
+        self.assertEqual(matched_source_ids, ["u-px101", "PX102", "PX103", "PX104", "PX105", "PX106", "PX107"])
+
+        # Check extracted dates on alternative phrasings
+        self.assertEqual(result.actual_end_date, "2026-11-07")
+        self.assertEqual(result.additional_observations[0].actual_end_date, "2026-11-11")
+        self.assertEqual(result.additional_observations[1].actual_end_date, "2026-11-17")
+
+    def test_generalization_mixed_confidence_one_ambiguous_does_not_block_high_confidence(self):
+        """Test C: 1 ambiguous or low-confidence observation does not block 2 high-confidence observations."""
+        raw_update = (
+            "Route survey and marking was completed on 7 November. "
+            "Right of way clearing was completed on 11 November. "
+            "General construction work is proceeding."
+        )
+        update_row = _make_update_row(raw_update=raw_update, location="Pipeline Section X", reported_on=datetime.date(2026, 11, 18))
+        tasks = [
+            MagicMock(id="u-px101", source_task_id="PX101", activity="Route Survey and Marking", location="Pipeline Section X", planned_start="2026-11-01", planned_end="2026-11-10", status="not_started"),
+            MagicMock(id="u-px102", source_task_id="PX102", activity="Right of Way Clearing", location="Pipeline Section X", planned_start="2026-11-05", planned_end="2026-11-15", status="not_started"),
+            MagicMock(id="u-px103", source_task_id="PX103", activity="Trench Excavation", location="Pipeline Section X", planned_start="2026-11-10", planned_end="2026-11-20", status="not_started"),
+        ]
+
+        actuals_updated_tasks: list[str] = []
+        def make_row(params):
+            r = MagicMock()
+            for k, v in params.items():
+                setattr(r, k, v)
+            r.processed_at = "2026-11-18T10:00:00"
+            r.is_current = True
+            return r
+
+        def db_execute(stmt, params=None):
+            sql = str(stmt)
+            res = MagicMock()
+            if "FROM site_updates" in sql:
+                res.fetchone.return_value = update_row
+            elif "FROM schedule_tasks" in sql:
+                res.fetchall.return_value = tasks
+            elif "UPDATE schedule_tasks" in sql:
+                p = params or {}
+                actuals_updated_tasks.append(p.get("task_id"))
+            elif "INSERT INTO ai_processed_updates" in sql:
+                p = params or {}
+                res.fetchone.return_value = make_row(p)
+            return res
+
+        mock_db = MagicMock()
+        mock_db.execute.side_effect = db_execute
+
+        res = process_site_update(mock_db, SAMPLE_UPDATE_ID, provider=MockAIProvider())
+
+        self.assertEqual(len(res), 3)
+        # High confidence observations auto-link
+        self.assertGreaterEqual(res[0]["confidence_score"], 80.0)
+        self.assertGreaterEqual(res[1]["confidence_score"], 80.0)
+        self.assertEqual(res[0]["matched_task_id"], "u-px101")
+        self.assertEqual(res[1]["matched_task_id"], "u-px102")
+
+        # Ambiguous / unlinked observation routes to review
+        self.assertLess(res[2]["confidence_score"], 80.0)
+        self.assertIsNone(res[2]["matched_task_id"])
+
+        # High confidence observations updated actuals; ambiguous one did NOT
+        self.assertEqual(actuals_updated_tasks, ["u-px101", "u-px102"])
+
+    def test_generalization_all_high_confidence_observations_auto_process(self):
+        """Test D: All high-confidence observations auto-process and update schedule actuals."""
+        raw_update = (
+            "Route survey and marking completed 100%. "
+            "Right of way clearing completed 100%. "
+            "Trench excavation reached 100% completion."
+        )
+        update_row = _make_update_row(raw_update=raw_update, location="Pipeline Section X", reported_on=datetime.date(2026, 11, 18))
+        tasks = [
+            MagicMock(id="u-px101", source_task_id="PX101", activity="Route Survey and Marking", location="Pipeline Section X", planned_start="2026-11-01", planned_end="2026-11-10", status="not_started"),
+            MagicMock(id="u-px102", source_task_id="PX102", activity="Right of Way Clearing", location="Pipeline Section X", planned_start="2026-11-05", planned_end="2026-11-15", status="not_started"),
+            MagicMock(id="u-px103", source_task_id="PX103", activity="Trench Excavation", location="Pipeline Section X", planned_start="2026-11-10", planned_end="2026-11-20", status="not_started"),
+        ]
+
+        actuals_updated: list[str] = []
+        def make_row(params):
+            r = MagicMock()
+            for k, v in params.items():
+                setattr(r, k, v)
+            r.processed_at = "2026-11-18T10:00:00"
+            r.is_current = True
+            return r
+
+        def db_execute(stmt, params=None):
+            sql = str(stmt)
+            res = MagicMock()
+            if "FROM site_updates" in sql:
+                res.fetchone.return_value = update_row
+            elif "FROM schedule_tasks" in sql:
+                res.fetchall.return_value = tasks
+            elif "UPDATE schedule_tasks" in sql:
+                p = params or {}
+                actuals_updated.append(p.get("task_id"))
+            elif "INSERT INTO ai_processed_updates" in sql:
+                p = params or {}
+                res.fetchone.return_value = make_row(p)
+            return res
+
+        mock_db = MagicMock()
+        mock_db.execute.side_effect = db_execute
+
+        res = process_site_update(mock_db, SAMPLE_UPDATE_ID, provider=MockAIProvider())
+
+        self.assertEqual(len(res), 3)
+        for obs in res:
+            self.assertGreaterEqual(obs["confidence_score"], 80.0)
+        self.assertEqual(actuals_updated, ["u-px101", "u-px102", "u-px103"])
+
+    def test_generalization_unmatched_observation_does_not_mutate_schedule(self):
+        """Test E: An unmatched observation never mutates any schedule tasks."""
+        raw_update = (
+            "Route survey and marking completed 100%. "
+            "Catering tent setup completed at dining hall."
+        )
+        update_row = _make_update_row(raw_update=raw_update, location="Pipeline Section X", reported_on=datetime.date(2026, 11, 18))
+        tasks = [
+            MagicMock(id="u-px101", source_task_id="PX101", activity="Route Survey and Marking", location="Pipeline Section X", planned_start="2026-11-01", planned_end="2026-11-10", status="not_started"),
+            MagicMock(id="u-px102", source_task_id="PX102", activity="Right of Way Clearing", location="Pipeline Section X", planned_start="2026-11-05", planned_end="2026-11-15", status="not_started"),
+        ]
+
+        actuals_updated: list[str] = []
+        def make_row(params):
+            r = MagicMock()
+            for k, v in params.items():
+                setattr(r, k, v)
+            r.processed_at = "2026-11-18T10:00:00"
+            r.is_current = True
+            return r
+
+        def db_execute(stmt, params=None):
+            sql = str(stmt)
+            res = MagicMock()
+            if "FROM site_updates" in sql:
+                res.fetchone.return_value = update_row
+            elif "FROM schedule_tasks" in sql:
+                res.fetchall.return_value = tasks
+            elif "UPDATE schedule_tasks" in sql:
+                p = params or {}
+                actuals_updated.append(p.get("task_id"))
+            elif "INSERT INTO ai_processed_updates" in sql:
+                p = params or {}
+                res.fetchone.return_value = make_row(p)
+            return res
+
+        mock_db = MagicMock()
+        mock_db.execute.side_effect = db_execute
+
+        res = process_site_update(mock_db, SAMPLE_UPDATE_ID, provider=MockAIProvider())
+
+        self.assertGreaterEqual(len(res), 2)
+        # Only u-px101 was updated
+        self.assertEqual(actuals_updated, ["u-px101"])
+        # Unmatched observation has None matched_task_id
+        self.assertIsNone(res[1]["matched_task_id"])
+
+    def test_generalization_reprocessing_expires_previous_observations_no_duplicates(self):
+        """Test F: Reprocessing a 7-activity update expires old rows and retains exactly 7 current rows."""
+        stored_rows: list[dict[str, Any]] = []
+        raw_update = (
+            "Daily pipeline construction report: Route survey and marking was "
+            "completed on 7 November. Right of way clearing was completed on "
+            "11 November. Trench excavation reached 100% completion on 17 November. "
+            "Sand bedding is currently 80% complete and progressing normally. "
+            "Pipe stringing has been completed. Pipeline welding has started and "
+            "is approximately 35% complete. Welding activities were delayed by "
+            "heavy rainfall for one working day. Weld inspection and NDT has not "
+            "started yet because welding is still in progress."
+        )
+        update_row = _make_update_row(raw_update=raw_update, location="Pipeline Section X", reported_on=datetime.date(2026, 11, 18))
+        tasks = [
+            MagicMock(id="u-px101", source_task_id="PX101", activity="Route Survey and Marking", location="Pipeline Section X", planned_start="2026-11-01", planned_end="2026-11-10", status="not_started"),
+            MagicMock(id="u-px102", source_task_id="PX102", activity="Right of Way Clearing", location="Pipeline Section X", planned_start="2026-11-05", planned_end="2026-11-15", status="not_started"),
+            MagicMock(id="u-px103", source_task_id="PX103", activity="Trench Excavation", location="Pipeline Section X", planned_start="2026-11-10", planned_end="2026-11-20", status="not_started"),
+            MagicMock(id="u-px104", source_task_id="PX104", activity="Sand Bedding", location="Pipeline Section X", planned_start="2026-11-15", planned_end="2026-11-25", status="not_started"),
+            MagicMock(id="u-px105", source_task_id="PX105", activity="Pipe Stringing", location="Pipeline Section X", planned_start="2026-11-20", planned_end="2026-11-30", status="not_started"),
+            MagicMock(id="u-px106", source_task_id="PX106", activity="Pipeline Welding", location="Pipeline Section X", planned_start="2026-11-25", planned_end="2026-12-05", status="not_started"),
+            MagicMock(id="u-px107", source_task_id="PX107", activity="Weld Inspection and NDT", location="Pipeline Section X", planned_start="2026-12-01", planned_end="2026-12-10", status="not_started"),
+        ]
+
+        def db_execute(stmt, params=None):
+            sql = str(stmt)
+            res = MagicMock()
+            if "FROM site_updates" in sql:
+                res.fetchone.return_value = update_row
+            elif "FROM schedule_tasks" in sql:
+                res.fetchall.return_value = tasks
+            elif "UPDATE ai_processed_updates" in sql and "is_current = false" in sql:
+                p = params or {}
+                for row in stored_rows:
+                    if row["site_update_id"] == p.get("site_update_id"):
+                        row["is_current"] = False
+            elif "INSERT INTO ai_processed_updates" in sql:
+                p = params or {}
+                row_data: dict[str, Any] = dict(p)
+                row_data["is_current"] = True
+                stored_rows.append(row_data)
+                mock_row = MagicMock()
+                for k, v in row_data.items():
+                    setattr(mock_row, str(k), v)
+                mock_row.processed_at = "2026-11-18T10:00:00"
+                res.fetchone.return_value = mock_row
+            return res
+
+        mock_db = MagicMock()
+        mock_db.execute.side_effect = db_execute
+
+        # Run 1
+        res1 = process_site_update(mock_db, SAMPLE_UPDATE_ID, provider=MockAIProvider())
+        self.assertEqual(len(res1), 7)
+        self.assertEqual(len([r for r in stored_rows if r["is_current"]]), 7)
+
+        # Run 2 (Reprocessing)
+        res2 = process_site_update(mock_db, SAMPLE_UPDATE_ID, provider=MockAIProvider())
+        self.assertEqual(len(res2), 7)
+
+        # Total 14 rows: 7 expired historical + 7 active current
+        self.assertEqual(len(stored_rows), 14)
+        current_rows = [r for r in stored_rows if r["is_current"]]
+        self.assertEqual(len(current_rows), 7)
+        self.assertEqual([r["observation_index"] for r in current_rows], list(range(7)))
+
+        historical_rows = [r for r in stored_rows if not r["is_current"]]
+        self.assertEqual(len(historical_rows), 7)
+        self.assertEqual([r["observation_index"] for r in historical_rows], list(range(7)))
+
+    def test_generalization_decoupled_extraction_independent_of_schedule_matching(self):
+        """Test G: Observation extraction works independently of schedule task IDs or names."""
+        raw_update = (
+            "Daily pipeline construction report: Route survey and marking was "
+            "completed on 7 November. Right of way clearing was completed on "
+            "11 November. Trench excavation reached 100% completion on 17 November. "
+            "Sand bedding is currently 80% complete and progressing normally. "
+            "Pipe stringing has been completed. Pipeline welding has started and "
+            "is approximately 35% complete. Welding activities were delayed by "
+            "heavy rainfall for one working day. Weld inspection and NDT has not "
+            "started yet because welding is still in progress."
+        )
+        # Pass empty tasks or unrelated tasks
+        result = MockAIProvider().analyse(
+            raw_update=raw_update,
+            location="Pipeline Section X",
+            reported_on="2026-11-18",
+            candidate_tasks=[],
+        )
+
+        all_obs = [result] + list(result.additional_observations)
+        self.assertEqual(len(all_obs), 7)
+
+        # 1. Route survey
+        self.assertEqual(all_obs[0].progress_percent, 100.0)
+        self.assertEqual(all_obs[0].status, "completed")
+        self.assertEqual(all_obs[0].actual_end_date, "2026-11-07")
+
+        # 2. ROW clearing
+        self.assertEqual(all_obs[1].progress_percent, 100.0)
+        self.assertEqual(all_obs[1].status, "completed")
+        self.assertEqual(all_obs[1].actual_end_date, "2026-11-11")
+
+        # 3. Trench excavation
+        self.assertEqual(all_obs[2].progress_percent, 100.0)
+        self.assertEqual(all_obs[2].status, "completed")
+        self.assertEqual(all_obs[2].actual_end_date, "2026-11-17")
+
+        # 4. Sand bedding
+        self.assertEqual(all_obs[3].progress_percent, 80.0)
+        self.assertEqual(all_obs[3].status, "in_progress")
+
+        # 5. Pipe stringing
+        self.assertEqual(all_obs[4].progress_percent, 100.0)
+        self.assertEqual(all_obs[4].status, "completed")
+
+        # 6. Pipeline welding
+        self.assertEqual(all_obs[5].progress_percent, 35.0)
+        self.assertEqual(all_obs[5].status, "in_progress")
+        self.assertEqual(all_obs[5].delay_days, 1)
+        self.assertIsNotNone(all_obs[5].delay_reason)
+        self.assertIn("heavy rainfall", all_obs[5].delay_reason.lower())
+
+        # 7. Weld inspection
+        self.assertIsNone(all_obs[6].progress_percent)
+        self.assertEqual(all_obs[6].status, "not_started")
+
 
 if __name__ == "__main__":
     unittest.main()

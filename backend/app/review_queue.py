@@ -428,6 +428,9 @@ def get_review_queue(
             else None
         )
 
+        obs_desc = model_resp.get("activity_description") or model_resp.get("activity")
+        scoring_text = obs_desc if obs_desc else r.raw_update
+
         suggested = _find_suggested_match(
             matched_st_id=r.matched_st_id,
             matched_source_task_id=r.matched_source_task_id,
@@ -437,25 +440,30 @@ def get_review_queue(
             matched_planned_end=r.matched_planned_end,
             model_resp=model_resp,
             location=r.location,
-            raw_update=r.raw_update,
+            raw_update=scoring_text,
             all_tasks=all_tasks,
         )
 
         candidates = _find_candidate_tasks(
             location=r.location,
-            raw_update=r.raw_update,
+            raw_update=scoring_text,
             all_tasks=all_tasks,
             limit=10,
         )
 
         # Ambiguity detection: check if multiple tasks at the location matched keywords
-        raw_lower = r.raw_update.lower()
-        keyword_matches = 0
-        for cand in candidates:
-            words = [w for w in re.findall(r"\w+", cand["activity"].lower()) if len(w) > 3]
-            if any(w in raw_lower for w in words):
-                keyword_matches += 1
-        is_ambiguous = (r.matched_task_id is None and keyword_matches >= 2)
+        # If model_response recorded an ambiguity flag, respect it.
+        # Otherwise, check keyword matches against the scoped scoring_text.
+        if "is_ambiguous" in model_resp:
+            is_ambiguous = bool(model_resp.get("is_ambiguous"))
+        else:
+            scoring_lower = scoring_text.lower()
+            keyword_matches = 0
+            for cand in candidates:
+                words = [w for w in re.findall(r"\w+", cand["activity"].lower()) if len(w) > 3]
+                if any(w in scoring_lower for w in words):
+                    keyword_matches += 1
+            is_ambiguous = (r.matched_task_id is None and keyword_matches >= 2)
 
         extracted_act = _extract_activity_name(model_resp, suggested)
         reason = _determine_review_reason(r.matched_task_id, conf, threshold, is_ambiguous=is_ambiguous)
@@ -531,6 +539,8 @@ def approve_match(
             for t in task_rows
         ]
         model_resp = _parse_model_response(row.model_response)
+        obs_desc = model_resp.get("activity_description") or model_resp.get("activity")
+        scoring_text = obs_desc if obs_desc else row.raw_update
         suggested = _find_suggested_match(
             matched_st_id=None,
             matched_source_task_id=None,
@@ -540,7 +550,7 @@ def approve_match(
             matched_planned_end=None,
             model_resp=model_resp,
             location=row.location,
-            raw_update=row.raw_update,
+            raw_update=scoring_text,
             all_tasks=all_tasks,
         )
         if suggested and suggested.get("task_id"):

@@ -577,6 +577,26 @@ def process_site_update(
     db.execute(_EXPIRE_CURRENT, {"site_update_id": update_id})
 
     # 6a. Insert primary observation (observation_index=0) — unchanged Phase 1 path.
+    prim_act_desc = getattr(result, "activity_description", None) or update_row.raw_update
+    prim_model_resp = dict(result.model_response) if isinstance(result.model_response, dict) else {}
+    prim_model_resp.setdefault("activity_description", prim_act_desc)
+    prim_model_resp.setdefault("activity", prim_act_desc)
+    prim_model_resp.setdefault("observation_index", 0)
+    prim_model_resp.setdefault("progress_percent", result.progress_percent)
+    prim_model_resp.setdefault("status", result.status)
+    prim_model_resp.setdefault("delay_days", result.delay_days)
+    prim_model_resp.setdefault("delay_reason", result.delay_reason)
+    prim_model_resp.setdefault("actual_start_date", result.actual_start_date)
+    prim_model_resp.setdefault("actual_end_date", result.actual_end_date)
+    tier = (
+        "high" if result.confidence_score >= AUTO_LINK_CONFIDENCE_THRESHOLD
+        else ("medium" if result.confidence_score >= PLANNER_REVIEW_MIN_THRESHOLD else "low")
+    )
+    prim_model_resp.setdefault("confidence_tier", tier)
+    prim_model_resp.setdefault("is_ambiguous", getattr(result, "is_ambiguous", False))
+    if not prim_model_resp.get("reasoning"):
+        prim_model_resp["reasoning"] = f"Observation 0: {prim_act_desc}."
+
     primary_row = db.execute(
         _INSERT_PROCESSED,
         {
@@ -591,7 +611,7 @@ def process_site_update(
             "actual_end_date": result.actual_end_date,
             "confidence_score": result.confidence_score,
             "model_name": result.model_name,
-            "model_response": json.dumps(result.model_response),
+            "model_response": json.dumps(prim_model_resp),
             "observation_index": 0,
         },
     ).fetchone()

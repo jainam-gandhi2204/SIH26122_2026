@@ -50,6 +50,7 @@ import json
 import logging
 import os
 import re
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -220,6 +221,7 @@ class AnalysisResult:
     model_name: str
     model_response: dict[str, Any]       # full model output for audit trail
     additional_observations: list[ActivityObservation] = field(default_factory=list)
+    activity_description: str | None = None  # Clause or description for the primary observation
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +309,15 @@ _STATUS_KEYWORDS: dict[str, str] = {
     # "not start" must come before "started"; "yet to start" before "start".
     "not start": "not_started",
     "yet to start": "not_started",
+    "not commence": "not_started",
+    "yet to commence": "not_started",
+    "not begun": "not_started",
+    "not begin": "not_started",
+    "has not started": "not_started",
+    "have not started": "not_started",
+    "has not commenced": "not_started",
+    "have not commenced": "not_started",
+    "not started": "not_started",
     # Vague progress qualifications must map to in_progress (progress_percent stays None)
     "almost complete": "in_progress",
     "almost done": "in_progress",
@@ -322,6 +333,8 @@ _STATUS_KEYWORDS: dict[str, str] = {
     "in progress": "in_progress",
     "ongoing": "in_progress",
     "started": "in_progress",
+    "commenced": "in_progress",
+    "commence": "in_progress",
     "underway": "in_progress",
     "continuing": "in_progress",
     "proceeding": "in_progress",
@@ -351,18 +364,18 @@ _DATE_TOKEN_PATTERN = (
     r"(?:"
     r"\d{4}[-/]\d{1,2}[-/]\d{1,2}"
     r"|\d{1,2}[-/]\d{1,2}[-/]\d{4}"
-    rf"|\d{{1,2}}(?:st|nd|rd|th)?[-/\s]+{_MONTHS_PATTERN}[-/\s,]+\d{{4}}"
-    rf"|{_MONTHS_PATTERN}\s+\d{{1,2}}(?:st|nd|rd|th)?,?\s+\d{{4}}"
+    rf"|\d{{1,2}}(?:st|nd|rd|th)?[-/\s]+{_MONTHS_PATTERN}(?:[-/\s,]+\d{{4}})?"
+    rf"|{_MONTHS_PATTERN}\s+\d{{1,2}}(?:st|nd|rd|th)?(?:,?\s+\d{{4}})?"
     r")"
 )
 
 _START_DATE_RE = re.compile(
-    rf"(?<!planned\s)(?<!target\s)\b(?:started|commenced|began|start\s*date|commencement\s*date|actual\s*start(?:\s*date)?)\b\s*(?:on|:|at|-|\bas of\b)?\s*(?P<date>{_DATE_TOKEN_PATTERN})",
+    rf"(?<!planned\s)(?<!target\s)\b(?:started|commenced|began|start(?:\s*date)?|commencement(?:\s*date)?|actual\s*start(?:\s*date)?)\b\s*(?:on|:|at|-|\bas of\b)?\s*(?P<date>{_DATE_TOKEN_PATTERN})",
     re.IGNORECASE,
 )
 
 _END_DATE_RE = re.compile(
-    rf"(?<!planned\s)(?<!target\s)\b(?:completed|finished|ended|completion\s*date|end\s*date|actual\s*end(?:\s*date)?)\b\s*(?:on|:|at|-|\bas of\b)?\s*(?P<date>{_DATE_TOKEN_PATTERN})",
+    rf"(?<!planned\s)(?<!target\s)\b(?:completed|finished|ended|completion(?:\s*date)?|end\s*date|actual\s*end(?:\s*date)?)\b\s*(?:on|:|at|-|\bas of\b)?\s*(?P<date>{_DATE_TOKEN_PATTERN})",
     re.IGNORECASE,
 )
 
@@ -386,11 +399,11 @@ _DATE_PARSE_FORMATS = (
 )
 
 
-def _parse_explicit_date(date_str: str) -> str | None:
+def _parse_explicit_date(date_str: str, reference_year: int | None = None) -> str | None:
     """Parse an explicitly stated date string into ISO YYYY-MM-DD format.
 
-    Returns None if the date cannot be parsed or represents an invalid
-    calendar date (e.g. Feb 31).
+    If the date specifies day and month without year, reference_year is used.
+    Returns None if the date cannot be parsed or represents an invalid calendar date.
     """
     if not date_str:
         return None
@@ -403,6 +416,9 @@ def _parse_explicit_date(date_str: str) -> str | None:
         except ValueError:
             return None
 
+    if reference_year and not re.search(r"\b\d{4}\b", cleaned):
+        cleaned = f"{cleaned} {reference_year}"
+
     for fmt in _DATE_PARSE_FORMATS:
         try:
             dt = datetime.datetime.strptime(cleaned, fmt)
@@ -412,35 +428,43 @@ def _parse_explicit_date(date_str: str) -> str | None:
     return None
 
 
-def _extract_start_date(text: str) -> str | None:
+def _extract_start_date(text: str, reference_year: int | None = None) -> str | None:
     """Extract actual start date from text if explicitly stated, else None."""
     matches = list(_START_DATE_RE.finditer(text))
     if not matches:
         return None
+    if reference_year is None:
+        ym = re.search(r"\b(202\d)\b", text)
+        if ym:
+            reference_year = int(ym.group(1))
     for m in matches:
         if "actual" in m.group(0).lower():
-            parsed = _parse_explicit_date(m.group("date"))
+            parsed = _parse_explicit_date(m.group("date"), reference_year=reference_year)
             if parsed:
                 return parsed
     for m in matches:
-        parsed = _parse_explicit_date(m.group("date"))
+        parsed = _parse_explicit_date(m.group("date"), reference_year=reference_year)
         if parsed:
             return parsed
     return None
 
 
-def _extract_end_date(text: str) -> str | None:
+def _extract_end_date(text: str, reference_year: int | None = None) -> str | None:
     """Extract actual completion / end date from text if explicitly stated, else None."""
     matches = list(_END_DATE_RE.finditer(text))
     if not matches:
         return None
+    if reference_year is None:
+        ym = re.search(r"\b(202\d)\b", text)
+        if ym:
+            reference_year = int(ym.group(1))
     for m in matches:
         if "actual" in m.group(0).lower():
-            parsed = _parse_explicit_date(m.group("date"))
+            parsed = _parse_explicit_date(m.group("date"), reference_year=reference_year)
             if parsed:
                 return parsed
     for m in matches:
-        parsed = _parse_explicit_date(m.group("date"))
+        parsed = _parse_explicit_date(m.group("date"), reference_year=reference_year)
         if parsed:
             return parsed
     return None
@@ -461,12 +485,12 @@ _WORD_TO_NUM: dict[str, int] = {
 def _extract_delay_days(text: str) -> int | None:
     """Extract delay magnitude in days from text.
 
-    Supports digits ('3 days delay', '2-day delay') and word numbers
-    ('two-day delay', 'three days behind').
+    Supports digits ('3 days delay', '2-day delay', '1 working day') and word numbers
+    ('two-day delay', 'one working day', 'three days behind').
     """
-    # 1. Matches: "2-day delay", "two-day delay", "three days behind", "1 day delay"
+    # 1. Matches: "2-day delay", "one working day", "two-day delay", "three days behind"
     pattern1 = re.search(
-        r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|fourteen)[-\s]+day[s]?(?:\s+(?:delay|behind|late|overdue|slip))?\b",
+        r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|fourteen)[-\s]+(?:working\s+|work\s+|calendar\s+)?day[s]?(?:\s+(?:delay|behind|late|overdue|slip))?\b",
         text,
         re.I,
     )
@@ -477,9 +501,9 @@ def _extract_delay_days(text: str) -> int | None:
         if raw_val in _WORD_TO_NUM:
             return _WORD_TO_NUM[raw_val]
 
-    # 2. Matches: "delayed by 2 days", "delayed by two days", "slip of 3 days"
+    # 2. Matches: "delayed by 2 days", "delayed by heavy rainfall for one working day"
     pattern2 = re.search(
-        r"\b(?:delay(?:ed)?\s*(?:by|of)?|behind\s*(?:by)?|late\s*(?:by)?|slip\s*(?:of)?)\s*(\d+|one|two|three|four|five|six|seven|eight|nine|ten|fourteen)\s*day[s]?\b",
+        r"\b(?:delay(?:ed)?\s*(?:by|of)?|behind\s*(?:by)?|late\s*(?:by)?|slip\s*(?:of)?)\s*(?:[^\d\n]{0,40}?\b)?(\d+|one|two|three|four|five|six|seven|eight|nine|ten|fourteen)\s+(?:working\s+|work\s+|calendar\s+)?day[s]?\b",
         text,
         re.I,
     )
@@ -495,6 +519,25 @@ def _extract_delay_days(text: str) -> int | None:
     if pattern3:
         return int(pattern3.group(1))
 
+    return None
+
+
+def _extract_delay_reason(text: str) -> str | None:
+    """Extract concise delay reason phrase from text."""
+    # Matches 'delayed by <reason> for', 'held up ... by <reason>', 'delayed due to <reason>'
+    m = re.search(
+        r"\b(?:delayed|held up)\s+(?:(?:activities|work)\s+)?(?:by|due to)\s+([^,.;\n]+?)(?:\s+(?:for\s+\w+\s+(?:working\s+)?day[s]?|due to|\.|$))",
+        text,
+        re.I,
+    )
+    if m:
+        return m.group(1).strip()
+    m2 = re.search(r"\b(?:held up|delayed)[^,.;\n]*?\bby\s+([^,.;\n]+)", text, re.I)
+    if m2:
+        return m2.group(1).strip()
+    for kw in ("rainfall", "heavy rain", "rain", "weather", "breakdown", "flooding", "permit", "landowner"):
+        if kw in text.lower():
+            return kw
     return None
 
 
@@ -817,8 +860,13 @@ def _parse_activity_clause(
     clause: str,
     location: str,
     candidate_tasks: list[dict[str, Any]],
+    reference_date: str | None = None,
+    reference_year: int | None = None,
 ) -> dict[str, Any]:
     """Parse a single activity clause or sentence into an observation dict."""
+    if reference_year is None and reference_date and len(reference_date) >= 4 and reference_date[:4].isdigit():
+        reference_year = int(reference_date[:4])
+
     norm_clause = normalize_with_aliases(clause, _ALL_ALIAS_PAIRS)
     c_lower = norm_clause.lower()
     matched_id, raw_conf, meta = evaluate_task_matches(candidate_tasks, norm_clause, location)
@@ -846,28 +894,40 @@ def _parse_activity_clause(
             status = mapped
             break
 
+    if progress is not None and status is None:
+        if progress >= 100.0:
+            status = "completed"
+        elif progress > 0.0:
+            status = "in_progress"
+        else:
+            status = "not_started"
+
     if progress is None and status == "completed":
         progress = 100.0
     if progress is not None and progress < 100.0 and status == "completed":
         status = "in_progress"
 
     delay_days = _extract_delay_days(clause)
-    delay_reason: str | None = None
+    delay_reason = _extract_delay_reason(clause)
     if delay_days is not None and delay_days > 0:
-        if progress is None or progress < 100.0:
+        if any(w in c_lower for w in ("started", "commenced", "proceeding", "underway", "ongoing")):
+            status = "in_progress"
+        elif progress is None or progress < 100.0:
             status = "delayed"
     elif "delay" in c_lower or "behind" in c_lower:
-        if progress is None or progress < 100.0:
+        if any(w in c_lower for w in ("started", "commenced", "proceeding", "underway", "ongoing")):
+            status = "in_progress"
+        elif progress is None or progress < 100.0:
             status = "delayed"
 
-    if status in ("delayed", "blocked"):
+    if status in ("delayed", "blocked") and not delay_reason:
         for kw in ("delay", "behind", "block", "halt", "stopp", "rainfall", "rain", "weather", "breakdown"):
             if kw in c_lower:
                 delay_reason = clause.strip()
                 break
 
-    start_d = _extract_start_date(clause)
-    end_d = _extract_end_date(clause)
+    start_d = _extract_start_date(clause, reference_year=reference_year)
+    end_d = _extract_end_date(clause, reference_year=reference_year)
 
     has_stat_kw = status is not None
     has_cands = len(candidate_tasks) > 0
@@ -951,22 +1011,52 @@ class MockAIProvider(AIProvider):
     ) -> AnalysisResult:
         # Check if update contains multiple distinct activity clauses / sentences
         clauses = _split_into_activity_clauses(raw_update)
-        tasks_with_activity_match = [
-            t["id"] for t in candidate_tasks
-            if _has_activity_keyword_match(t, raw_update)
-        ]
 
-        if len(clauses) > 1 and len(tasks_with_activity_match) >= 2:
+        if len(clauses) > 1:
             parsed_clauses = [
-                _parse_activity_clause(c, location, candidate_tasks)
+                _parse_activity_clause(c, location, candidate_tasks, reference_date=reported_on)
                 for c in clauses
             ]
+
+            # Merge consecutive clauses that describe the same task (e.g. progress + delay sentence)
+            merged_clauses: list[dict[str, Any]] = []
+            for p in parsed_clauses:
+                if merged_clauses:
+                    prev = merged_clauses[-1]
+                    same_task = (
+                        p.get("matched_source_task_id") is not None
+                        and p.get("matched_source_task_id") == prev.get("matched_source_task_id")
+                    )
+                    supplementary_sentence = (
+                        p.get("matched_task_id") is None
+                        and p.get("progress_percent") is None
+                        and (
+                            p.get("delay_days") is not None
+                            or p.get("delay_reason") is not None
+                            or p.get("actual_end_date") is not None
+                            or p.get("actual_start_date") is not None
+                        )
+                    )
+                    if same_task or supplementary_sentence:
+                        prev_text = prev["clause_text"] + ". " + p["clause_text"]
+                        merged_clauses[-1] = _parse_activity_clause(
+                            prev_text,
+                            location,
+                            candidate_tasks,
+                            reference_date=reported_on,
+                        )
+                        continue
+
+                merged_clauses.append(p)
+
             activity_clauses = [
-                p for p in parsed_clauses
+                p for p in merged_clauses
                 if p["matched_task_id"] is not None
                 or p["progress_percent"] is not None
-                or (p["status"] is not None and len(p["clause_text"]) > 10)
+                or p["status"] is not None
+                or p.get("delay_days") is not None
             ]
+
             matched_tasks = [p["matched_task_id"] for p in activity_clauses if p["matched_task_id"] is not None]
             unique_tasks = set(matched_tasks)
 
@@ -1012,6 +1102,8 @@ class MockAIProvider(AIProvider):
                 model_response: dict[str, Any] = {
                     "provider": _MOCK_MODEL_NAME,
                     "text_analysed": raw_update[:500],
+                    "activity_description": p0["clause_text"],
+                    "activity": p0["clause_text"],
                     "matched_source_task_id": p0["matched_source_task_id"],
                     "confidence_tier": p0["confidence_tier"],
                     "is_ambiguous": p0["is_ambiguous"],
@@ -1036,6 +1128,7 @@ class MockAIProvider(AIProvider):
                     model_name=_MOCK_MODEL_NAME,
                     model_response=model_response,
                     additional_observations=additional_obs,
+                    activity_description=p0["clause_text"],
                 )
 
         # Normalize the raw update text with both activity and location aliases
@@ -1147,6 +1240,8 @@ class MockAIProvider(AIProvider):
         model_response: dict[str, Any] = {
             "provider": _MOCK_MODEL_NAME,
             "text_analysed": raw_update[:500],
+            "activity_description": raw_update,
+            "activity": raw_update,
             "normalized_text": norm_update[:500] if norm_update != raw_update else None,
             "matched_source_task_id": match_meta.get("matched_source_task_id"),
             "confidence_tier": match_meta.get("confidence_tier"),
@@ -1186,6 +1281,7 @@ class MockAIProvider(AIProvider):
             model_name=_MOCK_MODEL_NAME,
             model_response=model_response,
             additional_observations=typed_additional,
+            activity_description=raw_update,
         )
 
 
@@ -1356,6 +1452,9 @@ PHASE 2 — MATCH it to the most appropriate schedule task (matching).
 Return a single JSON object with ALL of the following fields:
 
 === EXTRACTION FIELDS ===
+
+- activity_description (string):
+    The exact phrase or clause from the update describing the first/primary activity discussed.
 
 - progress_percent (number 0-100 or null):
     FACT ONLY. Extract if the update explicitly states a percentage for the work.
@@ -1670,26 +1769,51 @@ class GeminiAIProvider(AIProvider):
         parsed: dict[str, Any] = {}
 
         # --- Step 1: call the API (network / auth errors surface here) ---
-        try:
-            response = self._client.models.generate_content(
-                model=_GEMINI_MODEL,
-                contents=user_message,
-                config=self._types.GenerateContentConfig(
-                    system_instruction=_SYSTEM_PROMPT,
-                    response_mime_type="application/json",
-                    temperature=0.1,   # low temperature → more deterministic output
-                    max_output_tokens=3000,  # increased for multi-activity + reasoning
-                ),
-            )
-            raw_response_text = response.text or ""
-        except Exception as exc:  # network, auth, quota errors
+        last_api_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                response = self._client.models.generate_content(
+                    model=_GEMINI_MODEL,
+                    contents=user_message,
+                    config=self._types.GenerateContentConfig(
+                        system_instruction=_SYSTEM_PROMPT,
+                        response_mime_type="application/json",
+                        temperature=0.1,   # low temperature → more deterministic output
+                        max_output_tokens=8192,  # accommodate multi-activity + reasoning
+                    ),
+                )
+                raw_response_text = response.text or ""
+                break
+            except Exception as exc:
+                last_api_exc = exc
+                err_str = str(exc)
+                if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    logger.warning(
+                        "GeminiAIProvider: transient error on attempt %d (%s). Retrying...",
+                        attempt,
+                        type(exc).__name__,
+                    )
+                    time.sleep(1.0 * (attempt + 1))
+                    continue
+                break
+        else:
+            if last_api_exc is not None:
+                logger.warning(
+                    "GeminiAIProvider: all API attempts failed (%s: %s). "
+                    "Returning a low-confidence unknown result.",
+                    type(last_api_exc).__name__,
+                    str(last_api_exc)[:200],
+                )
+                return _unknown_result(_GEMINI_MODEL, str(last_api_exc), raw="")
+
+        if not raw_response_text and last_api_exc is not None:
             logger.warning(
                 "GeminiAIProvider: API call failed (%s: %s). "
                 "Returning a low-confidence unknown result.",
-                type(exc).__name__,
-                str(exc)[:200],
+                type(last_api_exc).__name__,
+                str(last_api_exc)[:200],
             )
-            return _unknown_result(_GEMINI_MODEL, str(exc), raw="")
+            return _unknown_result(_GEMINI_MODEL, str(last_api_exc), raw="")
 
         # --- Step 2: parse the model output (decode / format errors surface here) ---
         try:
@@ -1758,7 +1882,6 @@ class GeminiAIProvider(AIProvider):
             # No match from LLM — use deterministic fallback as hint
             det_score = 0.0
 
-
         composite = compute_composite_confidence(
             llm_confidence=llm_match_conf,
             llm_extraction_confidence=llm_extraction_conf,
@@ -1777,6 +1900,8 @@ class GeminiAIProvider(AIProvider):
             additional_obs_raw = []
         typed_additional = _dicts_to_activity_observations(additional_obs_raw)
 
+        act_desc = _safe_str(parsed.get("activity_description")) or raw_update
+
         return AnalysisResult(
             matched_task_id=matched_task_uuid,
             progress_percent=progress,
@@ -1789,6 +1914,8 @@ class GeminiAIProvider(AIProvider):
             model_name=_GEMINI_MODEL,
             model_response={
                 "raw_json": parsed,
+                "activity_description": act_desc,
+                "activity": act_desc,
                 "matched_source_task_id": matched_source,
                 "reasoning": _safe_str(parsed.get("reasoning")),
                 "extraction_confidence": llm_extraction_conf,
@@ -1799,6 +1926,7 @@ class GeminiAIProvider(AIProvider):
                 "additional_observations": additional_obs_raw,
             },
             additional_observations=typed_additional,
+            activity_description=act_desc,
         )
 
 
@@ -1845,7 +1973,22 @@ def _extract_json(text: str) -> dict[str, Any]:
     start = stripped.find("{")
     end = stripped.rfind("}")
     if start != -1 and end != -1 and end > start:
-        return json.loads(stripped[start : end + 1])
+        try:
+            return json.loads(stripped[start : end + 1])
+        except json.JSONDecodeError:
+            pass
+
+    # Try 4: Truncated JSON recovery (salvage completed items in additional_observations)
+    if "additional_observations" in stripped:
+        last_obj_end = stripped.rfind("}")
+        if last_obj_end != -1:
+            repaired = stripped[:last_obj_end + 1] + "\n  ]\n}"
+            try:
+                data = json.loads(repaired)
+                if isinstance(data, dict):
+                    return data
+            except json.JSONDecodeError:
+                pass
 
     raise ValueError(
         f"No JSON object found in model response (first 200 chars): {stripped[:200]!r}"
