@@ -931,6 +931,115 @@ class MultiActivityProcessingTests(unittest.TestCase):
         self.assertIn("uuid-106", actuals_updated_tasks)
         self.assertEqual(len(actuals_updated_tasks), 3)
 
+        # Requirements B & D: Each observation retains its own independent confidence and model/evidence data
+        for i in range(3):
+            mr = res[i]["model_response"]
+            self.assertIsNotNone(mr)
+            self.assertIsInstance(mr, dict)
+            self.assertIn("composite_confidence", mr)
+            self.assertIn("extraction_confidence", mr)
+            self.assertIn("match_confidence", mr)
+            self.assertIn("reasoning", mr)
+            self.assertIsNotNone(mr["reasoning"])
+
+    def test_production_observed_report_all_three_auto_link_with_location_variation(self):
+        """Production regression test: exact production input with Compressor Station D location
+
+        Tests Requirements A-D:
+        A) exact 3-activity input
+        B) each observation gets independent confidence
+        C) clear observations auto-link when actual signals are strong
+        D) secondary observations retain model/evidence data
+        """
+        mock_db = MagicMock()
+        update_row = _make_update_row(
+            raw_update=(
+                "Daily construction update: Foundation reinforcement has been "
+                "completed at 100%. Equipment foundation concrete has reached 60% "
+                "completion and is progressing normally. Equipment base plate "
+                "installation has not started yet."
+            ),
+            location="Compressor Station D",
+        )
+        tasks = [
+            MagicMock(id="uuid-104", source_task_id="MC104", activity="Foundation Reinforcement", location="Compressor Station C", planned_start="2026-09-11", planned_end="2026-09-20", status="not_started"),
+            MagicMock(id="uuid-105", source_task_id="MC105", activity="Equipment Foundation Concrete", location="Compressor Station C", planned_start="2026-09-21", planned_end="2026-09-30", status="not_started"),
+            MagicMock(id="uuid-106", source_task_id="MC106", activity="Equipment Base Plate Installation", location="Compressor Station C", planned_start="2026-10-01", planned_end="2026-10-10", status="not_started"),
+        ]
+
+        actuals_updated_tasks = []
+        inserted_rows = []
+
+        def make_row(params):
+            r = MagicMock()
+            for k, v in params.items():
+                setattr(r, k, v)
+            r.processed_at = "2026-09-26T10:00:00"
+            r.is_current = True
+            return r
+
+        def db_execute(stmt, params=None):
+            sql = str(stmt)
+            res = MagicMock()
+            if "FROM site_updates" in sql:
+                res.fetchone.return_value = update_row
+            elif "FROM schedule_tasks" in sql:
+                res.fetchall.return_value = tasks
+            elif "UPDATE schedule_tasks" in sql:
+                p = params or {}
+                actuals_updated_tasks.append(p.get("task_id"))
+            elif "INSERT INTO ai_processed_updates" in sql:
+                p = params or {}
+                row = make_row(p)
+                inserted_rows.append(row)
+                res.fetchone.return_value = row
+            return res
+
+        mock_db.execute.side_effect = db_execute
+
+        res = process_site_update(mock_db, SAMPLE_UPDATE_ID, provider=MockAIProvider())
+
+        # All 3 observations inserted and auto-linked
+        self.assertEqual(len(res), 3)
+        self.assertEqual(res[0]["matched_task_id"], "uuid-104")
+        self.assertEqual(res[1]["matched_task_id"], "uuid-105")
+        self.assertEqual(res[2]["matched_task_id"], "uuid-106")
+
+        # Independent extraction and status
+        self.assertEqual(res[0]["progress_percent"], 100.0)
+        self.assertEqual(res[0]["status"], "completed")
+
+        self.assertEqual(res[1]["progress_percent"], 60.0)
+        self.assertEqual(res[1]["status"], "in_progress")
+
+        self.assertIsNone(res[2]["progress_percent"])
+        self.assertEqual(res[2]["status"], "not_started")
+
+        # All 3 observations score >= 80.0 even with location variation
+        self.assertGreaterEqual(res[0]["confidence_score"], 80.0)
+        self.assertGreaterEqual(res[1]["confidence_score"], 80.0)
+        self.assertGreaterEqual(res[2]["confidence_score"], 80.0)
+
+        # All 3 tasks independently updated actuals in schedule_tasks
+        self.assertIn("uuid-104", actuals_updated_tasks)
+        self.assertIn("uuid-105", actuals_updated_tasks)
+        self.assertIn("uuid-106", actuals_updated_tasks)
+        self.assertEqual(len(actuals_updated_tasks), 3)
+
+        # Secondary observations retain model/evidence data
+        for i in range(3):
+            mr = res[i]["model_response"]
+            self.assertIsNotNone(mr, f"model_response is None for observation {i}")
+            self.assertIsInstance(mr, dict)
+            self.assertIn("composite_confidence", mr)
+            self.assertIn("extraction_confidence", mr)
+            self.assertIn("match_confidence", mr)
+            self.assertIn("reasoning", mr)
+            self.assertIsNotNone(mr["reasoning"])
+        # Secondary observations specifically retain raw_json
+        for i in (1, 2):
+            self.assertIn("raw_json", res[i]["model_response"])
+
     def test_scenario_b_two_high_confidence_one_ambiguous(self):
         """Scenario B: 2 high-confidence auto-process, only the ambiguous one enters review."""
         mock_db = MagicMock()

@@ -666,10 +666,11 @@ def _process_secondary_obs(
             scoring_text = obs.activity_description or raw_update
             norm_raw = normalize_with_aliases(scoring_text, _ALL_ALIAS_PAIRS)
             det_score = score_candidate_task(matched_task, norm_raw, location)
+            obs_loc = getattr(obs, "location_mentioned", None) or location
             loc_score = _location_match_score(
                 matched_task.get("location", "").lower(),
-                location.lower(),
-                raw_update.lower(),
+                obs_loc.lower(),
+                (scoring_text or raw_update).lower(),
             )
 
     llm_match_conf = getattr(obs, "match_confidence", None)
@@ -690,19 +691,47 @@ def _process_secondary_obs(
     if obs_confidence < PLANNER_REVIEW_MIN_THRESHOLD:
         matched_uuid = None   # No false match stored
 
-    # Build model_response for audit trail
-    obs_model_response = {
+    # Build model_response for audit trail and evidence retention
+    tier = (
+        "high" if obs_confidence >= AUTO_LINK_CONFIDENCE_THRESHOLD
+        else ("medium" if obs_confidence >= PLANNER_REVIEW_MIN_THRESHOLD else "low")
+    )
+    raw_evidence = getattr(obs, "raw_json", None) or getattr(obs, "model_response", None)
+    reasoning_text = getattr(obs, "reasoning", None)
+    if not reasoning_text:
+        if candidate_id and matched_uuid:
+            reasoning_text = (
+                f"High-confidence match to {candidate_id} ({obs.activity_description}) "
+                f"with {obs_confidence:.1f}% composite score."
+                if obs_confidence >= AUTO_LINK_CONFIDENCE_THRESHOLD
+                else f"Matched candidate {candidate_id} ({obs.activity_description}) with {obs_confidence:.1f}% composite score."
+            )
+        else:
+            reasoning_text = f"Secondary observation {obs_index}: {obs.activity_description}."
+
+    obs_model_response: dict[str, Any] = {
+        "provider": model_name,
         "observation_source": "additional_observations",
         "observation_index": obs_index,
         "activity_description": obs.activity_description,
+        "activity": obs.activity_description,
         "candidate_source_task_id": candidate_id,
+        "matched_source_task_id": candidate_id if matched_uuid else None,
+        "confidence_tier": tier,
+        "progress_percent": obs.progress_percent,
+        "status": obs.status,
+        "delay_days": obs.delay_days,
+        "delay_reason": obs.delay_reason,
+        "actual_start_date": getattr(obs, "actual_start_date", None),
+        "actual_end_date": getattr(obs, "actual_end_date", None),
         "extraction_confidence": obs.extraction_confidence,
         "match_confidence": llm_match_conf,
         "deterministic_score": det_score,
         "location_match_score": loc_score,
         "composite_confidence": obs_confidence,
         "is_ambiguous": getattr(obs, "is_ambiguous", False),
-        "reasoning": getattr(obs, "reasoning", None),
+        "reasoning": reasoning_text,
+        "raw_json": raw_evidence,
     }
 
     params: dict[str, Any] = {

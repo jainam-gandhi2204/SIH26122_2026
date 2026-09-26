@@ -489,6 +489,7 @@ def get_review_queue(
             "suggested_match": suggested,
             "candidate_tasks": candidates,
             "processed_at": str(r.processed_at) if r.processed_at else None,
+            "model_response": model_resp,
         })
 
     return items

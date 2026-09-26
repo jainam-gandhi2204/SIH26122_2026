@@ -191,6 +191,8 @@ class ActivityObservation:
     match_confidence: float | None = None      # Task matching confidence (0–100)
     is_ambiguous: bool = False                 # Ambiguity flag for this observation
     reasoning: str | None = None               # Audit reasoning for this observation
+    raw_json: dict[str, Any] | None = None     # Raw model response/evidence for this observation
+    model_response: dict[str, Any] | None = None  # Full model response dict if available
 
 
 
@@ -609,7 +611,7 @@ def score_candidate_task(
     # Check exact phrase or cleaned phrase (normalized)
     clean_phrase = " ".join(distinctive)
     if task_act in raw_lower or clean_phrase in raw_lower:
-        base_score = 95.0
+        base_score = 100.0
     else:
         matched_tokens = 0
         for tok in distinctive:
@@ -986,6 +988,8 @@ class MockAIProvider(AIProvider):
                         match_confidence=p["match_confidence"],
                         is_ambiguous=p["is_ambiguous"],
                         reasoning=p["reasoning"],
+                        raw_json=p,
+                        model_response=p,
                     )
                     additional_obs.append(obs)
 
@@ -1302,6 +1306,8 @@ def _dicts_to_activity_observations(
                 match_confidence=match_c,
                 is_ambiguous=is_amb,
                 reasoning=reas,
+                raw_json=dict(d),
+                model_response=dict(d),
             )
         )
     return result
@@ -1396,8 +1402,8 @@ Return a single JSON object with ALL of the following fields:
 
 - match_confidence (number 0-100):
     Your confidence specifically in the task identification match.
-    90-100: unambiguous match — activity, location, and context all strongly align.
-    70-89: clear match with minor uncertainty (e.g., location inferred from text).
+    90-100: unambiguous match — exact activity name match, or strong activity and location alignment.
+    70-89: clear match with minor uncertainty (e.g., location inferred from text, synonym used).
     50-69: plausible match but some signals are missing or ambiguous.
     20-49: weak match, only one signal aligns.
     0-19: no real match found.
@@ -1427,7 +1433,8 @@ Return a single JSON object with ALL of the following fields:
         "actual_start_date": <string "YYYY-MM-DD" or null>,
         "actual_end_date": <string "YYYY-MM-DD" or null>,
         "extraction_confidence": <number 0-100>,
-        "match_confidence": <number 0-100>
+        "match_confidence": <number 0-100>,
+        "reasoning": "..."                  // 1 sentence explaining the match and facts extracted
     }
     Set to null or empty array if only one activity is discussed.
 
@@ -1546,27 +1553,31 @@ Expected output:
 }
 
 Example 6 — Multi-activity:
-Update: "pipeline laid + welding done at WPA section 2"
+Update: "Foundation reinforcement completed at 100%. Equipment foundation concrete reached 60% completion."
 Expected output:
 {
-  "matched_source_task_id": "<primary task ID — likely Welding at WPA>",
+  "matched_source_task_id": "<foundation reinforcement task ID>",
   "progress_percent": 100,
   "status": "completed",
   "delay_days": null,
   "delay_reason": null,
   "actual_start_date": null,
   "actual_end_date": null,
-  "extraction_confidence": 75,
-  "match_confidence": 78,
-  "confidence_score": 75,
-  "reasoning": "INFERENCE: Two activities mentioned. Primary match: Welding (done = completed). Secondary: Pipeline Laying (laid = completed).",
+  "extraction_confidence": 95,
+  "match_confidence": 95,
+  "confidence_score": 95,
+  "reasoning": "FACT: Foundation reinforcement completed at 100%. Unambiguous exact match to Foundation Reinforcement task.",
   "additional_observations": [
     {
-      "candidate_source_task_id": "<pipeline task ID>",
-      "activity_description": "pipeline laid",
-      "progress_percent": 100,
-      "status": "completed",
-      "extraction_confidence": 70
+      "candidate_source_task_id": "<equipment foundation concrete task ID>",
+      "activity_description": "Equipment foundation concrete reached 60% completion",
+      "progress_percent": 60,
+      "status": "in_progress",
+      "actual_start_date": null,
+      "actual_end_date": null,
+      "extraction_confidence": 95,
+      "match_confidence": 95,
+      "reasoning": "FACT: 60% completion stated. Exact match to Equipment Foundation Concrete task."
     }
   ]
 }
