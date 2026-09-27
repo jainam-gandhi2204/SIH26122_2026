@@ -1368,20 +1368,27 @@ def _dicts_to_activity_observations(
             or "Unknown activity"
         )
         candidate_id = _safe_str(
-            d.get("candidate_source_task_id") or d.get("source_task_id")
+            d.get("candidate_source_task_id")
+            or d.get("source_task_id")
+            or d.get("matched_source_task_id")
         )
         progress = _safe_float(d.get("progress_percent"))
         status_raw = _safe_str(d.get("status"))
         status_val = status_raw if status_raw in _ALLOWED_STATUSES else None
         delay = _safe_int(d.get("delay_days"))
         delay_r = _safe_str(d.get("delay_reason"))
-        ext_conf_raw = d.get("extraction_confidence") or d.get("keyword_score") or 50.0
+        ext_conf_raw = (
+            d.get("extraction_confidence")
+            or d.get("confidence_score")
+            or d.get("keyword_score")
+            or 50.0
+        )
         ext_conf = max(0.0, min(100.0, float(ext_conf_raw)))
         loc = _safe_str(d.get("location") or d.get("location_mentioned"))
 
         start_d = _safe_iso_date(d.get("actual_start_date"))
         end_d = _safe_iso_date(d.get("actual_end_date"))
-        match_c = _safe_float(d.get("match_confidence"))
+        match_c = _safe_float(d.get("match_confidence") or d.get("confidence_score"))
         if match_c is not None:
             match_c = max(0.0, min(100.0, match_c))
         is_amb = bool(d.get("is_ambiguous", False))
@@ -1698,7 +1705,9 @@ class GeminiAIProvider(AIProvider):
     - Returns matched_task_id = None when composite confidence < 50.0.
     """
 
-    def __init__(self, api_key: str | None = None) -> None:
+    _model_name: str = _GEMINI_MODEL
+
+    def __init__(self, api_key: str | None = None, model_name: str | None = None) -> None:
         # Import here so that MockAIProvider tests never need google-genai
         try:
             import google.genai as genai
@@ -1719,6 +1728,7 @@ class GeminiAIProvider(AIProvider):
 
         self._client = genai.Client(api_key=resolved_key)
         self._types = genai_types
+        self._model_name = model_name or os.getenv("GEMINI_MODEL", _GEMINI_MODEL)
 
     def analyse(
         self,
@@ -1767,58 +1777,148 @@ class GeminiAIProvider(AIProvider):
 
         raw_response_text: str = ""
         parsed: dict[str, Any] = {}
+        model_name = getattr(self, "_model_name", None) or os.getenv("GEMINI_MODEL", _GEMINI_MODEL)
 
         # --- Step 1: call the API (network / auth errors surface here) ---
         last_api_exc: Exception | None = None
-        for attempt in range(3):
+        retry_attempts: int = 0
+        extracted_retry_delay: float | None = None
+
+        for attempt in range(_MAX_RETRY_ATTEMPTS):
+            retry_attempts = attempt + 1
             try:
+                gen_config_kwargs: dict[str, Any] = {
+                    "system_instruction": _SYSTEM_PROMPT,
+                    "response_mime_type": "application/json",
+                    "temperature": 0.1,   # low temperature → more deterministic output
+                    "max_output_tokens": 8192,  # accommodate multi-activity + reasoning
+                }
+                # Configure thinking_config if supported by SDK.
+                # thinking_budget=0 requests that internal thinking/reasoning process be disabled,
+                # focusing the response directly on structured JSON generation.
+                if hasattr(self._types, "ThinkingConfig"):
+                    try:
+                        gen_config_kwargs["thinking_config"] = self._types.ThinkingConfig(thinking_budget=0)
+                    except Exception:
+                        pass
+
                 response = self._client.models.generate_content(
-                    model=_GEMINI_MODEL,
+                    model=model_name,
                     contents=user_message,
-                    config=self._types.GenerateContentConfig(
-                        system_instruction=_SYSTEM_PROMPT,
-                        response_mime_type="application/json",
-                        temperature=0.1,   # low temperature → more deterministic output
-                        max_output_tokens=8192,  # accommodate multi-activity + reasoning
-                    ),
+                    config=self._types.GenerateContentConfig(**gen_config_kwargs),
                 )
-                raw_response_text = response.text or ""
+                if response and hasattr(response, "text") and response.text:
+                    raw_response_text = response.text
+                elif response and hasattr(response, "candidates") and response.candidates:
+                    cand = response.candidates[0]
+                    parts_text: list[str] = []
+                    if hasattr(cand, "content") and cand.content and hasattr(cand.content, "parts") and cand.content.parts is not None:
+                        for p in cand.content.parts:
+                            if hasattr(p, "text") and p.text:
+                                parts_text.append(p.text)
+                    raw_response_text = "".join(parts_text)
+                else:
+                    raw_response_text = ""
                 break
             except Exception as exc:
                 last_api_exc = exc
                 err_str = str(exc)
-                if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                    logger.warning(
-                        "GeminiAIProvider: transient error on attempt %d (%s). Retrying...",
-                        attempt,
-                        type(exc).__name__,
-                    )
-                    time.sleep(1.0 * (attempt + 1))
-                    continue
-                break
-        else:
-            if last_api_exc is not None:
-                logger.warning(
-                    "GeminiAIProvider: all API attempts failed (%s: %s). "
-                    "Returning a low-confidence unknown result.",
-                    type(last_api_exc).__name__,
-                    str(last_api_exc)[:200],
+                is_transient = (
+                    "503" in err_str
+                    or "UNAVAILABLE" in err_str
+                    or "429" in err_str
+                    or "RESOURCE_EXHAUSTED" in err_str
+                    or "timeout" in err_str.lower()
+                    or "deadline" in err_str.lower()
+                    or isinstance(exc, (TimeoutError, ConnectionError))
                 )
-                return _unknown_result(_GEMINI_MODEL, str(last_api_exc), raw="")
+                if not is_transient:
+                    break
 
-        if not raw_response_text and last_api_exc is not None:
-            logger.warning(
-                "GeminiAIProvider: API call failed (%s: %s). "
-                "Returning a low-confidence unknown result.",
-                type(last_api_exc).__name__,
-                str(last_api_exc)[:200],
+                # Extract provider-advised retry delay if present
+                delay = _extract_retry_delay(exc)
+                if delay is not None:
+                    extracted_retry_delay = delay
+                    if delay > _MAX_RETRY_DELAY:
+                        logger.warning(
+                            "GeminiAIProvider: provider requested retry delay of %.2fs "
+                            "which exceeds maximum allowed retry delay of %.2fs (quota exhaustion). "
+                            "Aborting retry to prevent long blocking request.",
+                            delay,
+                            _MAX_RETRY_DELAY,
+                        )
+                        break
+                    sleep_time = delay
+                else:
+                    # Exponential backoff capped at _MAX_RETRY_DELAY
+                    sleep_time = min(_MAX_RETRY_DELAY, 1.0 * (2 ** attempt))
+
+                if attempt + 1 < _MAX_RETRY_ATTEMPTS:
+                    logger.warning(
+                        "GeminiAIProvider: transient error on attempt %d (%s). "
+                        "Sleeping for %.2fs before retrying...",
+                        attempt + 1,
+                        type(exc).__name__,
+                        sleep_time,
+                    )
+                    time.sleep(sleep_time)
+                    continue
+                else:
+                    logger.warning(
+                        "GeminiAIProvider: transient error on attempt %d (%s). "
+                        "Max retry attempts (%d) exhausted.",
+                        attempt + 1,
+                        type(exc).__name__,
+                        _MAX_RETRY_ATTEMPTS,
+                    )
+                break
+
+        if last_api_exc is not None and not raw_response_text:
+            diagnostic = _classify_failure(
+                exc=last_api_exc,
+                raw_response_text="",
+                model_name=model_name,
+                retry_attempts=retry_attempts,
+                retry_delay=extracted_retry_delay,
             )
-            return _unknown_result(_GEMINI_MODEL, str(last_api_exc), raw="")
+            logger.warning(
+                "GeminiAIProvider: API call failed with %s (%s). "
+                "Returning a low-confidence unknown result with failure diagnostic.",
+                diagnostic["failure_type"],
+                type(last_api_exc).__name__,
+            )
+            return _unknown_result(
+                model_name=model_name,
+                error=str(last_api_exc),
+                raw="",
+                failure_diagnostic=diagnostic,
+            )
+
+        if not raw_response_text or not raw_response_text.strip():
+            diagnostic = _classify_failure(
+                exc=None,
+                raw_response_text="",
+                model_name=model_name,
+                retry_attempts=retry_attempts,
+            )
+            logger.warning("GeminiAIProvider: model returned an empty response.")
+            return _unknown_result(
+                model_name=model_name,
+                error="Model returned an empty response.",
+                raw="",
+                failure_diagnostic=diagnostic,
+            )
 
         # --- Step 2: parse the model output (decode / format errors surface here) ---
         try:
             parsed = _extract_json(raw_response_text)
         except (ValueError, json.JSONDecodeError) as exc:
+            diagnostic = _classify_failure(
+                exc=exc,
+                raw_response_text=raw_response_text,
+                model_name=model_name,
+                retry_attempts=retry_attempts,
+            )
             logger.warning(
                 "GeminiAIProvider: JSON parse failed (%s: %s). "
                 "Raw response (first 500 chars): %r",
@@ -1826,7 +1926,28 @@ class GeminiAIProvider(AIProvider):
                 str(exc),
                 raw_response_text[:500],
             )
-            return _unknown_result(_GEMINI_MODEL, str(exc), raw=raw_response_text)
+            return _unknown_result(
+                model_name=model_name,
+                error=str(exc),
+                raw=raw_response_text,
+                failure_diagnostic=diagnostic,
+            )
+
+        if not isinstance(parsed, dict):
+            diagnostic = _classify_failure(
+                exc=None,
+                raw_response_text=raw_response_text,
+                model_name=model_name,
+                retry_attempts=retry_attempts,
+                parsed_json=parsed,
+            )
+            logger.warning("GeminiAIProvider: schema validation failed (parsed JSON is not a dict).")
+            return _unknown_result(
+                model_name=model_name,
+                error=f"Expected JSON object, got {type(parsed).__name__}",
+                raw=raw_response_text,
+                failure_diagnostic=diagnostic,
+            )
 
         # --- Step 3: resolve task UUID ---
         matched_source = _safe_str(parsed.get("matched_source_task_id"))
@@ -1911,7 +2032,7 @@ class GeminiAIProvider(AIProvider):
             actual_start_date=actual_start,
             actual_end_date=actual_end,
             confidence_score=composite,
-            model_name=_GEMINI_MODEL,
+            model_name=model_name,
             model_response={
                 "raw_json": parsed,
                 "activity_description": act_desc,
@@ -1957,24 +2078,50 @@ def _extract_json(text: str) -> dict[str, Any]:
     if not text or not text.strip():
         raise ValueError("Model returned an empty response.")
 
-    # Try 1: direct parse (fastest path; works when MIME type is honoured)
     stripped = text.strip()
+
+    def _normalize_parsed(data: Any) -> dict[str, Any]:
+        if isinstance(data, dict):
+            if "observations" in data and isinstance(data["observations"], list) and data["observations"]:
+                obs_list = data["observations"]
+                primary = dict(obs_list[0]) if isinstance(obs_list[0], dict) else {}
+                if "additional_observations" not in primary:
+                    primary["additional_observations"] = [
+                        x for x in obs_list[1:] if isinstance(x, dict)
+                    ]
+                for k, v in data.items():
+                    if k != "observations" and k not in primary:
+                        primary[k] = v
+                return primary
+            return data
+        if isinstance(data, list):
+            if data and isinstance(data[0], dict):
+                primary = dict(data[0])
+                if "additional_observations" not in primary:
+                    primary["additional_observations"] = [
+                        x for x in data[1:] if isinstance(x, dict)
+                    ]
+                return primary
+            raise ValueError("Model response is a list but contains no valid dictionary items.")
+        raise ValueError(f"Model response JSON is not an object or array: {type(data).__name__}")
+
+    # Try 1: direct parse (fastest path; works when MIME type is honoured)
     try:
-        return json.loads(stripped)
+        return _normalize_parsed(json.loads(stripped))
     except json.JSONDecodeError:
         pass
 
     # Try 2: extract from a markdown fence
     fence_match = _FENCE_RE.search(stripped)
     if fence_match:
-        return json.loads(fence_match.group(1))
+        return _normalize_parsed(json.loads(fence_match.group(1)))
 
     # Try 3: find the first '{' and last '}' and try to parse that substring
     start = stripped.find("{")
     end = stripped.rfind("}")
     if start != -1 and end != -1 and end > start:
         try:
-            return json.loads(stripped[start : end + 1])
+            return _normalize_parsed(json.loads(stripped[start : end + 1]))
         except json.JSONDecodeError:
             pass
 
@@ -1995,8 +2142,188 @@ def _extract_json(text: str) -> dict[str, Any]:
     )
 
 
-def _unknown_result(model_name: str, error: str, raw: str) -> AnalysisResult:
-    """Return a zero-confidence AnalysisResult for use in error/fallback paths."""
+def sanitize_error_message(msg: str) -> str:
+    """Sanitize error messages to ensure no API keys or secrets are exposed."""
+    if not msg:
+        return ""
+    s = str(msg)
+    # Redact Google API keys (AIza...)
+    s = re.sub(r"AIza[0-9A-Za-z_-]{35}", "AIza[REDACTED]", s)
+    # Redact key=... parameters
+    s = re.sub(r"((?:key|api_key|token|auth)=)([^&\s]+)", r"\1[REDACTED]", s, flags=re.I)
+    # Redact Bearer tokens
+    s = re.sub(r"(Bearer\s+)[A-Za-z0-9_\-\.]+", r"\1[REDACTED]", s, flags=re.I)
+    return s
+
+
+_RETRY_IN_RE = re.compile(
+    r"(?:retry\s+(?:in|after)|wait)\s+([0-9]+(?:\.[0-9]+)?)\s*s?",
+    re.IGNORECASE,
+)
+_RETRY_AFTER_HEADER_RE = re.compile(
+    r"retry-after:\s*([0-9]+(?:\.[0-9]+)?)",
+    re.IGNORECASE,
+)
+_MAX_RETRY_DELAY = 10.0  # seconds: max sleep to avoid blocking synchronous requests
+_MAX_RETRY_ATTEMPTS = 3
+
+
+def _extract_retry_delay(exc: Exception) -> float | None:
+    """Extract provider-suggested retry delay in seconds from an exception if available.
+
+    Inspects:
+    1. HTTP response headers ('retry-after', 'Retry-After') if exc.response is present.
+    2. Google RPC RetryInfo in exc.details if present.
+    3. Error message text patterns (e.g. 'Please retry in 42.447211746s.').
+    """
+    # 1. Check HTTP response headers if available
+    response = getattr(exc, "response", None)
+    if response is not None:
+        headers = getattr(response, "headers", None)
+        if headers and hasattr(headers, "get"):
+            retry_after = headers.get("retry-after") or headers.get("Retry-After")
+            if retry_after:
+                try:
+                    return float(retry_after)
+                except (ValueError, TypeError):
+                    pass
+
+    # 2. Check structured details (e.g., google.rpc.RetryInfo)
+    details = getattr(exc, "details", None)
+    if isinstance(details, dict):
+        error_dict = details.get("error", {})
+        err_details_list = error_dict.get("details", []) if isinstance(error_dict, dict) else []
+        if isinstance(details.get("details"), list):
+            err_details_list = list(err_details_list) + details["details"]
+        for item in err_details_list:
+            if isinstance(item, dict) and "retryDelay" in item:
+                delay_str = str(item["retryDelay"]).rstrip("s")
+                try:
+                    return float(delay_str)
+                except (ValueError, TypeError):
+                    pass
+
+    # 3. Check error string / message text
+    msg = getattr(exc, "message", None) or str(exc)
+    match = _RETRY_IN_RE.search(msg)
+    if match:
+        try:
+            return float(match.group(1))
+        except (ValueError, TypeError):
+            pass
+
+    match_header = _RETRY_AFTER_HEADER_RE.search(msg)
+    if match_header:
+        try:
+            return float(match_header.group(1))
+        except (ValueError, TypeError):
+            pass
+
+    return None
+
+
+def _classify_failure(
+    exc: Exception | None,
+    raw_response_text: str = "",
+    model_name: str = _GEMINI_MODEL,
+    retry_attempts: int = 0,
+    parsed_json: Any = None,
+    retry_delay: float | None = None,
+) -> dict[str, Any]:
+    """Classify a Gemini API/parsing failure into a safe, structured diagnostic.
+
+    Failure types:
+    - rate_limit: 429, quota exhausted, rate limit exceeded
+    - timeout: TimeoutError, deadline exceeded, 504
+    - api_error: 500, 503, connection/network errors, other client errors
+    - empty_response: model returned no text or empty content
+    - invalid_json: model returned text but JSON parsing failed
+    - schema_validation: JSON parsed but does not match required schema
+    - unknown: unexpected failure
+    """
+    raw_clean = (raw_response_text or "").strip()
+    raw_available = bool(raw_clean)
+
+    if exc is not None:
+        err_str = str(exc)
+        err_lower = err_str.lower()
+        err_class = type(exc).__name__
+
+        if "429" in err_str or "resource_exhausted" in err_lower or "quota" in err_lower or "rate limit" in err_lower:
+            fail_type = "rate_limit"
+        elif "timeout" in err_lower or "timed out" in err_lower or "deadline exceeded" in err_lower or "504" in err_str:
+            fail_type = "timeout"
+        elif isinstance(exc, (ValueError, json.JSONDecodeError)) and raw_available:
+            fail_type = "invalid_json"
+        elif "empty" in err_lower and not raw_available:
+            fail_type = "empty_response"
+        else:
+            fail_type = "api_error"
+
+        sanitized_msg = sanitize_error_message(err_str)
+    elif not raw_available:
+        fail_type = "empty_response"
+        err_class = "EmptyResponseError"
+        sanitized_msg = "Model returned an empty response or candidate content was empty."
+    elif parsed_json is not None and not isinstance(parsed_json, dict):
+        fail_type = "schema_validation"
+        err_class = "SchemaValidationError"
+        sanitized_msg = f"Expected JSON object, got {type(parsed_json).__name__}."
+    else:
+        fail_type = "unknown"
+        err_class = "UnknownError"
+        sanitized_msg = "Unknown Gemini processing error."
+
+    diag: dict[str, Any] = {
+        "failure_type": fail_type,
+        "provider": "gemini",
+        "model": model_name,
+        "retry_attempts": retry_attempts,
+        "error_class": err_class,
+        "error_message": sanitized_msg[:500],
+        "raw_response_available": raw_available,
+    }
+    if retry_delay is not None:
+        diag["retry_delay"] = round(retry_delay, 3)
+    return diag
+
+
+def _unknown_result(
+    model_name: str,
+    error: str,
+    raw: str = "",
+    failure_diagnostic: dict[str, Any] | None = None,
+) -> AnalysisResult:
+    """Return a zero-confidence AnalysisResult with safe structured failure diagnostic."""
+    sanitized_err = sanitize_error_message(error)
+    sanitized_raw = sanitize_error_message(raw) if raw else ""
+
+    if failure_diagnostic is None:
+        raw_available = bool(sanitized_raw.strip())
+        err_lower = sanitized_err.lower()
+        if "429" in sanitized_err or "resource_exhausted" in err_lower or "quota" in err_lower:
+            fail_type = "rate_limit"
+        elif "timeout" in err_lower or "timed out" in err_lower or "deadline exceeded" in err_lower:
+            fail_type = "timeout"
+        elif not raw_available or "empty" in err_lower:
+            fail_type = "empty_response"
+        elif "json" in err_lower or "decode" in err_lower:
+            fail_type = "invalid_json"
+        elif sanitized_err:
+            fail_type = "api_error"
+        else:
+            fail_type = "unknown"
+
+        failure_diagnostic = {
+            "failure_type": fail_type,
+            "provider": "gemini",
+            "model": model_name,
+            "retry_attempts": 0,
+            "error_class": "Exception",
+            "error_message": sanitized_err[:500],
+            "raw_response_available": raw_available,
+        }
+
     return AnalysisResult(
         matched_task_id=None,
         progress_percent=None,
@@ -2008,10 +2335,14 @@ def _unknown_result(model_name: str, error: str, raw: str) -> AnalysisResult:
         confidence_score=0.0,
         model_name=model_name,
         model_response={
-            "error": error[:500],
-            "raw": raw[:500],
-            "note": "API call or parse failed; all fields UNKNOWN.",
+            "failure_diagnostic": failure_diagnostic,
+            "failure_type": failure_diagnostic.get("failure_type", "unknown"),
+            "error": sanitized_err[:500],
+            "raw_response": sanitized_raw[:2000] if sanitized_raw else "",
+            "raw": sanitized_raw[:500] if sanitized_raw else "",
+            "note": f"Gemini {failure_diagnostic.get('failure_type', 'unknown')}: {sanitized_err[:200]}",
         },
+        additional_observations=[],
     )
 
 

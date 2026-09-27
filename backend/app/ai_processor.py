@@ -595,7 +595,11 @@ def process_site_update(
     prim_model_resp.setdefault("confidence_tier", tier)
     prim_model_resp.setdefault("is_ambiguous", getattr(result, "is_ambiguous", False))
     if not prim_model_resp.get("reasoning"):
-        prim_model_resp["reasoning"] = f"Observation 0: {prim_act_desc}."
+        diag = prim_model_resp.get("failure_diagnostic")
+        if isinstance(diag, dict) and diag.get("failure_type"):
+            prim_model_resp["reasoning"] = f"AI Provider failure ({diag.get('failure_type')}): {diag.get('error_message', '')[:200]}"
+        else:
+            prim_model_resp["reasoning"] = f"Observation 0: {prim_act_desc}."
 
     primary_row = db.execute(
         _INSERT_PROCESSED,

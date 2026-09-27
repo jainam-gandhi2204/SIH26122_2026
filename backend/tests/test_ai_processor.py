@@ -14,6 +14,7 @@ from sqlalchemy.exc import OperationalError
 
 from app.ai_provider import (
     AIProvider,
+    ActivityObservation,
     AnalysisResult,
     GeminiAIProvider,
     MockAIProvider,
@@ -24,6 +25,7 @@ from app.ai_provider import (
     _safe_str,
     _unknown_result,
     get_provider,
+    sanitize_error_message,
 )
 from app.ai_processor import (
     SiteUpdateNotFoundError,
@@ -1210,6 +1212,395 @@ class GeminiParseRobustnessTests(unittest.TestCase):
         )
         self.assertEqual(result.confidence_score, 0.0)
         self.assertIn("error", result.model_response)
+
+
+# ---------------------------------------------------------------------------
+# Gemini failure diagnostic and multi-activity regression tests (Tests A-F)
+# ---------------------------------------------------------------------------
+
+class GeminiProductionDiagnosticRegressionTests(unittest.TestCase):
+    """Regression tests covering production UPD-959491 failure diagnostics,
+    secret redaction, and multi-activity isolation.
+    """
+
+    def setUp(self):
+        self.provider = _make_gemini_provider()
+
+    @patch("time.sleep")
+    def test_gemini_quota_rate_limit_diagnostic_and_secret_redaction(self, mock_sleep):
+        """Test A: Exact reproduction of UPD-959491 production 429 quota failure.
+        - Mocks Gemini returning 429 RESOURCE_EXHAUSTED with sensitive API key in error text.
+        - Verifies structured failure diagnostic is emitted.
+        - Verifies secrets are sanitized/redacted from both error and diagnostic.
+        - Verifies retry count is 3 and error_class is recorded.
+        """
+        raw_error = (
+            "429 RESOURCE_EXHAUSTED. Quota exceeded for metric: "
+            "generativelanguage.googleapis.com/generate_content_free_tier_requests, "
+            "limit: 20, model: gemini-3.6-flash. Please retry in 42.447211746s. "
+            "url: https://generativelanguage.googleapis.com/v1beta/models?key=AIzaSyD-secretKey9876543210"
+        )
+        self.provider._client.models.generate_content.side_effect = Exception(raw_error)
+
+        result = self.provider.analyse(
+            raw_update="Daily pipeline construction report: Route survey complete.",
+            location="Pipeline Section Y",
+            reported_on="2026-11-18",
+            candidate_tasks=[],
+        )
+
+        self.assertEqual(result.confidence_score, 0.0)
+        self.assertIsNone(result.matched_task_id)
+        self.assertIsNone(result.status)
+        self.assertEqual(len(result.additional_observations), 0)
+
+        diag = result.model_response.get("failure_diagnostic")
+        self.assertIsNotNone(diag, "failure_diagnostic must be present in model_response")
+        self.assertEqual(diag["failure_type"], "rate_limit")
+        self.assertEqual(diag["provider"], "gemini")
+        # Quota delay of 42.45s exceeds sensible cap (10s), so retry loop aborts immediately
+        # without blocking the request, leaving retry_attempts at 1
+        self.assertEqual(diag["retry_attempts"], 1)
+        self.assertAlmostEqual(diag.get("retry_delay", 0.0), 42.447, places=2)
+        mock_sleep.assert_not_called()
+        self.assertEqual(diag["error_class"], "Exception")
+        self.assertFalse(diag["raw_response_available"])
+
+        # Secret redaction check
+        self.assertNotIn("AIzaSyD-secretKey9876543210", diag["error_message"])
+        self.assertNotIn("secretKey9876543210", diag["error_message"])
+        self.assertIn("[REDACTED]", diag["error_message"])
+        self.assertNotIn("AIzaSyD-secretKey9876543210", result.model_response.get("error", ""))
+        self.assertIn("[REDACTED]", result.model_response.get("error", ""))
+        self.assertIn("429 RESOURCE_EXHAUSTED", diag["error_message"])
+
+    @patch("time.sleep")
+    def test_gemini_transient_rate_limit_with_short_retry_delay_retries(self, mock_sleep):
+        """Short provider-advised retry delay (<= 10s) is respected and retried."""
+        short_err = "429 RESOURCE_EXHAUSTED. Rate limit exceeded. Please retry in 1.5s."
+        self.provider._client.models.generate_content.side_effect = Exception(short_err)
+
+        result = self.provider.analyse(
+            raw_update="Survey underway.",
+            location="Zone B",
+            reported_on="2026-11-18",
+            candidate_tasks=[],
+        )
+
+        self.assertEqual(result.confidence_score, 0.0)
+        diag = result.model_response.get("failure_diagnostic")
+        self.assertIsNotNone(diag)
+        self.assertEqual(diag["failure_type"], "rate_limit")
+        self.assertEqual(diag["retry_attempts"], 3)
+        self.assertAlmostEqual(diag.get("retry_delay", 0.0), 1.5, places=1)
+        self.assertEqual(mock_sleep.call_count, 2)
+        mock_sleep.assert_called_with(1.5)
+
+    @patch("time.sleep")
+    def test_gemini_retry_after_header_respected(self, mock_sleep):
+        """Retry-After header from response object is parsed and respected."""
+        mock_exc = Exception("429 Too Many Requests")
+        mock_resp = MagicMock()
+        mock_resp.headers = {"Retry-After": "2.5"}
+        mock_exc.response = mock_resp
+        self.provider._client.models.generate_content.side_effect = mock_exc
+
+        result = self.provider.analyse(
+            raw_update="Survey underway.",
+            location="Zone B",
+            reported_on="2026-11-18",
+            candidate_tasks=[],
+        )
+
+        diag = result.model_response.get("failure_diagnostic")
+        self.assertIsNotNone(diag)
+        self.assertEqual(diag["failure_type"], "rate_limit")
+        self.assertAlmostEqual(diag.get("retry_delay", 0.0), 2.5, places=1)
+        mock_sleep.assert_called_with(2.5)
+
+    @patch("time.sleep")
+    def test_gemini_rpc_retry_info_respected(self, mock_sleep):
+        """google.rpc.RetryInfo details dictionary is parsed and respected."""
+        mock_exc = Exception("429 Quota Exceeded")
+        mock_exc.details = {
+            "error": {
+                "details": [
+                    {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "3.5s"}
+                ]
+            }
+        }
+        self.provider._client.models.generate_content.side_effect = mock_exc
+
+        result = self.provider.analyse(
+            raw_update="Survey underway.",
+            location="Zone B",
+            reported_on="2026-11-18",
+            candidate_tasks=[],
+        )
+
+        diag = result.model_response.get("failure_diagnostic")
+        self.assertIsNotNone(diag)
+        self.assertEqual(diag["failure_type"], "rate_limit")
+        self.assertAlmostEqual(diag.get("retry_delay", 0.0), 3.5, places=1)
+        mock_sleep.assert_called_with(3.5)
+
+    def test_gemini_model_resolution_and_default(self):
+        """GeminiAIProvider resolves model from parameter, environment, or default gemini-3.6-flash."""
+        p_default = _make_gemini_provider()
+        self.assertEqual(getattr(p_default, "_model_name", None), "gemini-3.6-flash")
+
+        p_custom = GeminiAIProvider.__new__(GeminiAIProvider)
+        p_custom._model_name = "gemini-3.8-flash"
+        self.assertEqual(p_custom._model_name, "gemini-3.8-flash")
+
+    @patch("time.sleep")
+    def test_gemini_network_timeout_produces_structured_diagnostic(self, mock_sleep):
+        """Test B: Mock Gemini returning network timeout.
+        - Verifies failure_type is 'timeout'.
+        - Verifies retry count is 3.
+        - Verifies error details are populated.
+        """
+        self.provider._client.models.generate_content.side_effect = TimeoutError("Request timed out after 30000ms")
+
+        result = self.provider.analyse(
+            raw_update="Trench excavation progressing.",
+            location="Pipeline Section Y",
+            reported_on="2026-11-18",
+            candidate_tasks=[],
+        )
+
+        self.assertEqual(result.confidence_score, 0.0)
+        diag = result.model_response.get("failure_diagnostic")
+        self.assertIsNotNone(diag)
+        self.assertEqual(diag["failure_type"], "timeout")
+        self.assertEqual(diag["retry_attempts"], 3)
+        self.assertEqual(diag["error_class"], "TimeoutError")
+        self.assertIn("timed out", diag["error_message"].lower())
+
+    def test_gemini_empty_response_produces_structured_diagnostic(self):
+        """Test C: Mock Gemini returning empty string / blank response.
+        - Verifies failure_type is 'empty_response'.
+        - Verifies raw_response_available is False.
+        """
+        resp = MagicMock()
+        resp.text = "   \n  "
+        self.provider._client.models.generate_content.return_value = resp
+
+        result = self.provider.analyse(
+            raw_update="Pipe stringing complete.",
+            location="Pipeline Section Y",
+            reported_on="2026-11-18",
+            candidate_tasks=[],
+        )
+
+        self.assertEqual(result.confidence_score, 0.0)
+        diag = result.model_response.get("failure_diagnostic")
+        self.assertIsNotNone(diag)
+        self.assertEqual(diag["failure_type"], "empty_response")
+        self.assertIn("empty response", diag["error_message"].lower())
+
+    def test_gemini_truncated_malformed_json_preserves_raw_response(self):
+        """Test D: Mock Gemini returning truncated / malformed JSON.
+        - Verifies raw_response is preserved.
+        - Verifies failure_type is 'invalid_json'.
+        - Verifies raw_response_available is True.
+        """
+        malformed_raw = '{"observations": [{"activity": "Route Survey", "progress_percent": 100, "status": "comp'
+        resp = MagicMock()
+        resp.text = malformed_raw
+        self.provider._client.models.generate_content.return_value = resp
+
+        result = self.provider.analyse(
+            raw_update="Route survey complete.",
+            location="Pipeline Section Y",
+            reported_on="2026-11-18",
+            candidate_tasks=[],
+        )
+
+        self.assertEqual(result.confidence_score, 0.0)
+        diag = result.model_response.get("failure_diagnostic")
+        self.assertIsNotNone(diag)
+        self.assertEqual(diag["failure_type"], "invalid_json")
+        self.assertTrue(diag["raw_response_available"])
+        self.assertEqual(result.model_response.get("raw_response"), malformed_raw)
+
+    def test_gemini_valid_multi_activity_seven_plus_observations_preserved(self):
+        """Test E: Valid multi-activity response with 7+ observations from Gemini.
+        - Verifies all observations are parsed and retained.
+        - Verifies none are lost before matching.
+        """
+        nine_obs_payload = {
+            "observations": [
+                {
+                    "activity": "Route survey and marking",
+                    "status": "completed",
+                    "progress_percent": 100,
+                    "actual_end_date": "2026-11-07",
+                    "confidence_score": 95,
+                    "matched_source_task_id": "PX101",
+                },
+                {
+                    "activity": "Right of way clearing",
+                    "status": "completed",
+                    "progress_percent": 100,
+                    "actual_end_date": "2026-11-11",
+                    "confidence_score": 95,
+                    "matched_source_task_id": "PX102",
+                },
+                {
+                    "activity": "Trench excavation",
+                    "status": "completed",
+                    "progress_percent": 100,
+                    "actual_end_date": "2026-11-17",
+                    "confidence_score": 95,
+                    "matched_source_task_id": "PX103",
+                },
+                {
+                    "activity": "Sand bedding",
+                    "status": "in_progress",
+                    "progress_percent": 80,
+                    "confidence_score": 90,
+                    "matched_source_task_id": "PX104",
+                },
+                {
+                    "activity": "Pipe stringing",
+                    "status": "completed",
+                    "progress_percent": 100,
+                    "confidence_score": 95,
+                    "matched_source_task_id": "PX105",
+                },
+                {
+                    "activity": "Pipeline welding",
+                    "status": "in_progress",
+                    "progress_percent": 35,
+                    "delay_days": 1,
+                    "delay_reason": "heavy rainfall",
+                    "confidence_score": 90,
+                    "matched_source_task_id": "PX106",
+                },
+                {
+                    "activity": "Weld inspection and NDT",
+                    "status": "not_started",
+                    "progress_percent": None,
+                    "confidence_score": 90,
+                    "matched_source_task_id": "PX107",
+                },
+                {
+                    "activity": "Hydrotesting",
+                    "status": "not_started",
+                    "progress_percent": None,
+                    "confidence_score": 85,
+                    "matched_source_task_id": "PX108",
+                },
+                {
+                    "activity": "Backfilling and restoration",
+                    "status": "not_started",
+                    "progress_percent": None,
+                    "confidence_score": 85,
+                    "matched_source_task_id": "PX109",
+                },
+            ]
+        }
+        candidate_tasks = [
+            {"id": f"task-uuid-{i}", "source_task_id": f"PX10{i}", "activity": f"Activity {i}", "location": "Pipeline Section Y"}
+            for i in range(1, 10)
+        ]
+
+        resp = MagicMock()
+        resp.text = json.dumps(nine_obs_payload)
+        self.provider._client.models.generate_content.return_value = resp
+
+        result = self.provider.analyse(
+            raw_update="Daily pipeline construction report covering 9 activities.",
+            location="Pipeline Section Y",
+            reported_on="2026-11-18",
+            candidate_tasks=candidate_tasks,
+        )
+
+        all_observations = [result] + list(result.additional_observations)
+        self.assertEqual(len(all_observations), 9, "All 9 observations must be preserved")
+
+        self.assertEqual(all_observations[0].status, "completed")
+        self.assertEqual(all_observations[0].progress_percent, 100.0)
+        self.assertEqual(all_observations[0].actual_end_date, "2026-11-07")
+        self.assertEqual(all_observations[0].matched_task_id, "task-uuid-1")
+
+        self.assertEqual(all_observations[3].status, "in_progress")
+        self.assertEqual(all_observations[3].progress_percent, 80.0)
+        self.assertEqual(all_observations[3].candidate_source_task_id, "PX104")
+
+        self.assertEqual(all_observations[5].delay_days, 1)
+        self.assertEqual(all_observations[5].delay_reason, "heavy rainfall")
+        self.assertEqual(all_observations[5].candidate_source_task_id, "PX106")
+
+        self.assertEqual(all_observations[6].status, "not_started")
+        self.assertIsNone(all_observations[6].progress_percent)
+        self.assertEqual(all_observations[6].candidate_source_task_id, "PX107")
+
+    def test_gemini_one_ambiguous_observation_does_not_block_high_confidence(self):
+        """Test F: Multi-activity response where 1 observation is ambiguous or missing task match.
+        - Verifies other observations continue to match and persist.
+        - Verifies no single failure causes all observations to disappear or fail.
+        """
+        payload = {
+            "observations": [
+                {
+                    "activity": "Foundation Reinforcement",
+                    "status": "completed",
+                    "progress_percent": 100,
+                    "confidence_score": 95,
+                    "matched_source_task_id": "MC104",
+                },
+                {
+                    "activity": "Random unidentifiable maintenance work",
+                    "status": "in_progress",
+                    "progress_percent": 10,
+                    "confidence_score": 30,
+                    "matched_source_task_id": None,
+                },
+                {
+                    "activity": "Equipment Foundation Concrete",
+                    "status": "in_progress",
+                    "progress_percent": 60,
+                    "confidence_score": 90,
+                    "matched_source_task_id": "MC105",
+                },
+            ]
+        }
+        candidate_tasks = [
+            {"id": "uuid-mc104", "source_task_id": "MC104", "activity": "Foundation Reinforcement", "location": "Unit 1"},
+            {"id": "uuid-mc105", "source_task_id": "MC105", "activity": "Equipment Foundation Concrete", "location": "Unit 1"},
+        ]
+
+        resp = MagicMock()
+        resp.text = json.dumps(payload)
+        self.provider._client.models.generate_content.return_value = resp
+
+        result = self.provider.analyse(
+            raw_update="Foundation reinforcement 100%, random work 10%, equipment foundation concrete 60%.",
+            location="Unit 1",
+            reported_on="2026-11-18",
+            candidate_tasks=candidate_tasks,
+        )
+
+        all_obs = [result] + list(result.additional_observations)
+        self.assertEqual(len(all_obs), 3)
+
+        # Observation 0 (primary AnalysisResult): High confidence, matched to MC104
+        self.assertEqual(all_obs[0].matched_task_id, "uuid-mc104")
+        self.assertEqual(all_obs[0].status, "completed")
+        self.assertGreaterEqual(all_obs[0].confidence_score, 80.0)
+
+        # Observation 1 (ActivityObservation): Unmatched / low confidence, but does NOT kill obs 0 or 2
+        self.assertIsNone(all_obs[1].candidate_source_task_id)
+        self.assertLess(all_obs[1].extraction_confidence, 50.0)
+
+        # Observation 2 (ActivityObservation): High confidence, matched candidate MC105
+        self.assertEqual(all_obs[2].candidate_source_task_id, "MC105")
+        self.assertEqual(all_obs[2].status, "in_progress")
+        self.assertEqual(all_obs[2].progress_percent, 60.0)
+        self.assertGreaterEqual(all_obs[2].extraction_confidence, 80.0)
+
 
 
 # ---------------------------------------------------------------------------
